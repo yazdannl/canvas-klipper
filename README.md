@@ -20,13 +20,12 @@ There is an unresolved silicon/configuration discrepancy: hardware notes identif
 
 ## Quick start
 
-1. Read [wiring](docs/wiring.md), [firmware](docs/firmware.md), [flashing/recovery](docs/flashing.md), and [control usage](docs/usage.md). Resolve the board identity and recovery gate before connecting or writing firmware.
-2. Build the pinned firmware in an isolated workspace when needed: `firmware/build.sh klipper`. This does not flash hardware. The script also creates the Linux-process dictionary used by the batch-mode test.
-3. Point the safe extras installer at your Klipper checkout: `KLIPPER_DIR="$HOME/klipper" ./install.sh`. It creates symlinks only and refuses conflicting files. It never edits printer configuration or applies MCU patches.
-4. Manually merge `config/canvas.cfg` and `config/canvas_macros.cfg`, replacing every `TO BE MEASURED` item with verified values. Set the required extruder feed/retract lengths and speeds, calibrate Hall resolution and choose `separation_method: cutter` or `tip_forming`. Replace the cutter placeholder with a tested actuator macro if cutter mode is used.
-5. Review generated slicer G-code and existing `T0`–`T3` macros for conflicts. Restart Klipper manually, check `CANVAS_STATUS`, and only then plan controlled bench validation. The example macros are not universal cutter or pin configurations.
+Read [wiring](docs/wiring.md), [firmware](docs/firmware.md), [flashing/recovery](docs/flashing.md), and [control usage](docs/usage.md) before connecting hardware. This project remains experimental and software/simulation-tested only.
 
-`install.sh` prints the separate MCU patch/build instructions. It does not modify the Klipper source tree or build/flash firmware. Never use a generic pin example on a real printer.
+1. `./canvas-klipper.sh flash` — checks Moonraker print state, builds missing/stale pinned outputs (offers apt dependency installation when needed), detects the USB device, then stages Katapult and Klipper. The default detection asks you to unplug/replug the unit; `--device PATH` or `--vid-pid VVVV:PPPP` can select it explicitly. Flashing prints the GD32F303 vs STM32F401 warning and requires one exact typed risk phrase. No stock flash-backup tooling/image is available; recovery may require SWD. Optional verified files: `--backup-file PATH --recovery-file PATH`. `--dry-run` does not query Moonraker or open serial; `--yes --i-understand-the-risks` is the non-interactive authorization pair.
+2. `./canvas-klipper.sh install` — detects Klipper/config directories, links host extras, installs templates, asks which filament switch is the toolhead sensor and which separation method to use, writes serial/config references and Moonraker update-manager metadata, and makes timestamped `.bak` copies before config changes. Because the distributed template intentionally has no measured motor/lane pins, the first run stages the config but defers restart. Fill in those values and rerun; it restarts only when the Canvas config is complete and Moonraker reports idle. It refuses printing/paused state and unknown state unless `--force`.
+
+`install` will not guess Canvas pins or patch/build the Klipper MCU firmware. Review and measure every `TO_BE_MEASURED` setting, apply/build the documented MCU support as needed, and check the hardware/recovery mismatch before use. Uninstall/status are available as `./canvas-klipper.sh uninstall` and `./canvas-klipper.sh status`; see the [flashing](docs/flashing.md) and [usage](docs/usage.md) guides for flags and safety details.
 
 ## Commands
 
