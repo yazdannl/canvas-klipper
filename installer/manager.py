@@ -204,6 +204,12 @@ def canvas_config_complete(printer_cfg: Path, canvas_cfg: Path) -> bool:
     settings = canvas_settings(config_paths(printer_cfg, canvas_cfg))
     if "__duplicate_sections__" in settings:
         return False
+    # Any surviving placeholder in the Canvas config itself, including optional sensor
+    # pins, means the scaffold is not finished; Klipper must not load it yet.
+    own = canvas_settings([canvas_cfg]) if canvas_cfg.is_file() else {}
+    if any("TO_BE_MEASURED" in value.upper()
+           for section in own.values() for value in section.values()):
+        return False
     canvas = settings.get("canvas", {})
     serial = settings.get("mcu canvas", {}).get("serial", "")
     sensor = canvas.get("toolhead_sensor", "")
@@ -622,8 +628,11 @@ def install(args) -> int:
                   "Klipper will refuse to start until the items below are filled in." % INCLUDE_LINE)
         print("Fill in %s:" % canvas_cfg)
         print("  - switch_pin for [filament_switch_sensor %s] (or your existing sensor)" % sensor)
-        print("  - lane_T0_motor, lane_T0_present_pin and lane_T0_prep_pin for T0..T3")
+        print("  - lane_T0_motor..lane_T3_motor with each lane's present_pin and prep_pin")
         print("  - [drv8833 T0..T3] motor_fwd, motor_rwd, motor_hall and motor_hall_resolution")
+        print("  - any optional pin still marked TO_BE_MEASURED (cutter_sensor_pin, hub_tangle_pin)")
+        print("Published CC1 CANVAS values and their sources are in docs/canvas-pins.md;")
+        print("they are confirmed in public config, not verified on your hardware.")
         print("Then rerun: %s install  (it activates %s and restarts Klipper/Moonraker only when idle)"
               % (ROOT / "canvas-klipper.sh", INCLUDE_LINE))
         return 0

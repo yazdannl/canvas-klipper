@@ -163,19 +163,74 @@ def test_install_without_sensor_generates_sensor_config(tmp_path, monkeypatch, m
 
 
 def add_measured_pins(config_dir):
+    """Fill the shipped template's remaining placeholder: the lane-present switches.
+
+    The distributed template now carries the published driver and prep pins, so the only
+    unresolved values are the four lane_T*_present_pin keys, which no public source maps.
+    """
     path = config_dir / "canvas/canvas.cfg"
     text = path.read_text()
-    lane_lines = "".join(
-        "lane_T%d_motor: T%d\nlane_T%d_present_pin: canvas:PA%d\nlane_T%d_prep_pin: canvas:PB%d\n" %
-        (lane, lane, lane, lane, lane, lane)
-        for lane in range(4))
-    insertion = text.index("# T0 example.")
-    text = text[:insertion] + lane_lines + text[insertion:]
     for lane in range(4):
-        text += ("\n[drv8833 T%d]\nmotor_fwd: canvas:PA%d\nmotor_rwd: canvas:PB%d\n"
-                 "motor_hall: canvas:PC%d\nmotor_hall_resolution: 0.5\n" %
-                 (lane, lane, lane, lane))
+        assert "lane_T%d_present_pin: TO_BE_MEASURED" % lane in text
+        text = text.replace("lane_T%d_present_pin: TO_BE_MEASURED" % lane,
+                            "lane_T%d_present_pin: canvas:PC%d" % (lane, 4 + lane))
     path.write_text(text)
+
+
+def test_shipped_template_leaves_only_lane_present_pins_unmeasured():
+    """The distributed template must be complete except for the unmeasured lane-present keys."""
+    template = (ROOT / "config/canvas.cfg").read_text()
+    settings = manager.canvas_settings([ROOT / "config/canvas.cfg"])
+    assert "__duplicate_sections__" not in settings
+    canvas = settings["canvas"]
+    for lane in range(4):
+        driver = settings["drv8833 t%d" % lane]
+        for option in ("motor_fwd", "motor_rwd", "motor_hall", "motor_hall_resolution"):
+            assert driver[option] and not driver[option].startswith("TO_BE_MEASURED")
+        assert canvas["lane_t%d_motor" % lane] == "T%d" % lane
+        assert canvas["lane_t%d_prep_pin" % lane].startswith("canvas:")
+        assert canvas["lane_t%d_present_pin" % lane] == "TO_BE_MEASURED"
+    # Any other placeholder would be a silent gap in the published pin map.
+    leftovers = [line for line in template.splitlines()
+                 if "TO_BE_MEASURED" in line and not line.strip().startswith("#")
+                 and not line.strip().startswith("lane_T")]
+    assert leftovers == []
+
+
+def test_canvas_config_complete_requires_every_pin_to_be_real(tmp_path):
+    """Any single remaining placeholder anywhere must keep the include inactive."""
+    config = tmp_path / "printer_data/config"
+    (config / "canvas").mkdir(parents=True)
+    (config / "printer.cfg").write_text(
+        "[extruder]\nstep_pin: PA0\n\n[filament_switch_sensor tool_sensor]\n"
+        "switch_pin: PA1\n", encoding="utf-8")
+    canvas_cfg = config / "canvas/canvas.cfg"
+    shipped = (ROOT / "config/canvas.cfg").read_text(encoding="utf-8").replace(
+        "toolhead_sensor: toolhead", "toolhead_sensor: tool_sensor")
+    def with_measured_present_pins(text):
+        for lane in range(4):
+            text = text.replace("lane_T%d_present_pin: TO_BE_MEASURED" % lane,
+                                "lane_T%d_present_pin: canvas:PC%d" % (lane, 4 + lane))
+        return text
+    head = "[mcu canvas]\nserial: /dev/serial/by-id/usb-Canvas\n\n"
+    canvas_cfg.write_text(head + shipped, encoding="utf-8")
+    assert manager.canvas_config_complete(config / "printer.cfg", canvas_cfg) is False
+    complete = head + with_measured_present_pins(shipped)
+    canvas_cfg.write_text(complete, encoding="utf-8")
+    assert manager.canvas_config_complete(config / "printer.cfg", canvas_cfg) is True
+    for source, broken in (("motor_hall: canvas:PB6", "motor_hall: TO_BE_MEASURED"),
+                           ("motor_hall_resolution: 0.26242",
+                            "motor_hall_resolution: TO_BE_MEASURED"),
+                           ("lane_T1_prep_pin: canvas:PC7",
+                            "lane_T1_prep_pin: TO_BE_MEASURED"),
+                           ("cutter_sensor_pin: !hotend:PC5",
+                            "cutter_sensor_pin: TO_BE_MEASURED")):
+        assert source in complete
+        canvas_cfg.write_text(complete.replace(source, broken, 1), encoding="utf-8")
+        assert manager.canvas_config_complete(config / "printer.cfg", canvas_cfg) is False, broken
+    canvas_cfg.write_text(complete.replace("serial: /dev/serial/by-id/usb-Canvas",
+                                           "serial: TO_BE_MEASURED"), encoding="utf-8")
+    assert manager.canvas_config_complete(config / "printer.cfg", canvas_cfg) is False
 
 
 def test_restart_waits_for_measured_config_then_is_idempotent(tmp_path, monkeypatch, moonraker):
