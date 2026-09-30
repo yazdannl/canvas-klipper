@@ -30,8 +30,8 @@ class FakeMCU:
         self.oid += 1
         return self.oid
 
-    def register_response(self, callback, name, oid):
-        self.responses[(name, oid)] = callback
+    def register_serial_response(self, callback, msgformat, oid):
+        self.responses[(msgformat.split()[0], oid)] = callback
 
     def register_config_callback(self, callback):
         self.config_callbacks.append(callback)

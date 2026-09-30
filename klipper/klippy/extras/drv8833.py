@@ -41,7 +41,10 @@ class MCUDrv8833Controller:
         self.direction = 1
         self.target_speed = 0.0
         self._set_cmd = self._manual_cmd = self._pid_cmd = None
-        self.mcu.register_response(self._handle_status, "drv8833_status", self.oid)
+        self.mcu.register_serial_response(
+            self._handle_status,
+            "drv8833_status oid=%c active=%c manual=%c count=%u speed=%u duty=%hu",
+            self.oid)
         self.mcu.register_config_callback(self._build_config)
 
     def _pid_value(self, value):

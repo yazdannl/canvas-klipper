@@ -1,3 +1,6 @@
+import importlib.util
+from pathlib import Path
+
 import pytest
 
 from canvas.canvas import Canvas, CanvasError, LANE_NAMES
@@ -15,6 +18,9 @@ class FakeConfig:
     def get_printer(self):
         return self.printer
 
+    def get_name(self):
+        return self.values.get("_name", "drv8833 T0")
+
     def get(self, key, default=...):
         if key in self.values:
             return self.values[key]
@@ -28,9 +34,11 @@ class FakeConfig:
             raise ConfigError("invalid integer " + key)
         return value
 
-    def getfloat(self, key, default=..., minval=None, above=None):
+    def getfloat(self, key, default=..., minval=None, maxval=None, above=None):
         value = float(self.get(key, default))
         if minval is not None and value < minval:
+            raise ConfigError("invalid float " + key)
+        if maxval is not None and value > maxval:
             raise ConfigError("invalid float " + key)
         if above is not None and value <= above:
             raise ConfigError("invalid float " + key)
@@ -112,18 +120,154 @@ class FakeMotor:
         self.hardware = hardware
         self.speed = 0.0
         self.history = []
+        self.hall_resolution = 0.5
+        self.hall_count = 0
+        self.hall_distance = 0.0
+        self._hall_travel = 0.0
+        self.stop_distance = None
+        self._distance_travel = 0.0
         self.hardware.motors[name] = self
 
     def drv8833_set_speed(self, speed):
         self.speed = float(speed)
+        self.stop_distance = None
+        if self.speed:
+            self.hall_count = 0
+            self.hall_distance = 0.0
+            self._hall_travel = 0.0
         self.history.append(self.speed)
 
     def drv8833_move(self, speed, distance, wait_for_completion=True):
-        direction = 1 if distance >= 0 else -1
-        self.drv8833_set_speed(abs(speed) * direction)
+        signed_speed = abs(float(speed)) * (1 if distance >= 0 else -1)
+        self.drv8833_set_speed(signed_speed)
+        self.stop_distance = abs(float(distance))
+        self._distance_travel = 0.0
+        if wait_for_completion:
+            while self.speed:
+                self.hardware.reactor.pause(self.hardware.reactor.now + 0.005)
+
+    def stop(self):
+        self.speed = 0.0
+        self.stop_distance = None
+        self.history.append(self.speed)
+
+    def record_hall(self, distance):
+        self._hall_travel += abs(distance)
+        self.hall_count = int(self._hall_travel / self.hall_resolution)
+        self.hall_distance = self.hall_count * self.hall_resolution
 
     def get_status(self, eventtime=None):
-        return {"active": self.speed != 0, "speed": self.speed}
+        return {"active": self.speed != 0, "manual": False,
+                "direction": "forwards" if self.speed >= 0 else "backwards",
+                "target_speed": abs(self.speed), "duty_cycle": 0.0,
+                "hall_speed": abs(self.speed), "hall_count": self.hall_count,
+                "hall_distance": self.hall_distance,
+                "pid_kp": 1.2, "pid_ki": 0.8, "pid_kd": 0.02}
+
+
+class FakeMCUCommand:
+    def __init__(self, mcu, format_string):
+        self.mcu = mcu
+        self.format_string = format_string
+
+    def send(self, args):
+        self.mcu.send(self.format_string, args)
+
+
+class FakeMCU:
+    def __init__(self):
+        self.next_oid = 0
+        self.responses = {}
+        self.config_callbacks = []
+        self.drivers = {}
+        self.config_commands = []
+
+    def create_oid(self):
+        oid = self.next_oid
+        self.next_oid += 1
+        return oid
+
+    def register_serial_response(self, callback, msgformat, oid):
+        self.responses[(msgformat.split()[0], oid)] = callback
+
+    def register_config_callback(self, callback):
+        self.config_callbacks.append(callback)
+
+    def get_constant_float(self, name):
+        assert name == "PWM_MAX"
+        return 255.0
+
+    def seconds_to_clock(self, seconds):
+        return int(seconds * 1000000)
+
+    def add_config_cmd(self, command, **kwargs):
+        self.config_commands.append(command)
+
+    def lookup_command(self, format_string):
+        return FakeMCUCommand(self, format_string)
+
+    def bind_driver(self, driver):
+        self.drivers[driver.hall_controller.oid] = driver
+        driver._fake_mcu = self
+        driver._sim_hall_travel = 0.0
+        driver._fake_stop_ticks = 0
+
+    def build_config(self):
+        for callback in self.config_callbacks:
+            callback()
+
+    def send(self, format_string, args):
+        driver = self.drivers[args[0]]
+        controller = driver.hall_controller
+        if format_string.startswith("drv8833_set "):
+            _, enabled, direction, target_speed, stop_ticks = args
+            if enabled:
+                controller.active = True
+                controller.manual = False
+                controller.direction = 1 if direction else -1
+                controller.target_speed = target_speed / 1000.0
+                controller.hall_count = 0
+                controller.speed = 0.0
+                driver._sim_hall_travel = 0.0
+                driver._fake_stop_ticks = int(stop_ticks)
+            else:
+                controller.active = False
+                controller.target_speed = 0.0
+                driver._fake_stop_ticks = 0
+            self.report_status(driver)
+        elif format_string.startswith("drv8833_manual "):
+            _, enabled, direction, duty = args
+            controller.active = bool(enabled)
+            controller.manual = bool(enabled)
+            controller.direction = 1 if direction else -1
+            driver._sim_hall_travel = 0.0
+            self.report_status(driver)
+        elif format_string.startswith("drv8833_set_pid "):
+            _, kp, ki, kd = args
+            scale = 10000.0
+            controller.pid_kp = kp / scale
+            controller.pid_ki = ki / scale
+            controller.pid_kd = kd / scale
+
+    def report_status(self, driver, active=None):
+        controller = driver.hall_controller
+        if active is not None:
+            controller.active = active
+        self.responses[("drv8833_status", controller.oid)]({
+            "active": controller.active,
+            "manual": controller.manual,
+            "count": controller.hall_count,
+            "speed": int(controller.speed * 1000),
+            "duty": int(controller.duty * 10),
+        })
+
+
+class FakePins:
+    def __init__(self, mcu):
+        self.mcu = mcu
+
+    def lookup_pin(self, pin, can_pullup=False):
+        return {"chip": self.mcu, "pin": int(pin[4:]), "pullup": 0}
 
 
 class FakeButtons:
@@ -299,23 +443,56 @@ class Hardware:
         self.set_pin("hub", self.positions[name] > 35.0)
         # Toolhead sensor is provided as a status object, not a button pin.
 
+    @staticmethod
+    def _motor_speed(motor):
+        controller = getattr(motor, "hall_controller", None)
+        if controller is not None:
+            if not controller.active:
+                return 0.0
+            return controller.direction * controller.target_speed
+        return motor.speed
+
     def _move(self, name, distance, hall=True):
         self.positions[name] += distance
         self._update_sensors(name)
-        if hall:
-            lane = self.printer.reactor.canvas.lanes[name]
-            pulses = int(abs(self.positions[name]) / lane.odometer_mm_per_pulse)
-            while lane.odometer_count < pulses:
-                lane.odometer_callback(self.reactor.now, True)
-                lane.odometer_callback(self.reactor.now, False)
+        if not hall:
+            return
+        motor = self.motors[name]
+        controller = getattr(motor, "hall_controller", None)
+        if controller is None:
+            motor.record_hall(distance)
+            return
+        resolution = controller.hall_resolution
+        travel = getattr(motor, "_sim_hall_travel", 0.0) + abs(distance)
+        motor._sim_hall_travel = travel
+        controller.hall_count = int(travel / resolution)
+        controller.speed = abs(controller.target_speed)
+        motor._fake_mcu.report_status(motor, active=controller.active)
 
     def advance(self, duration):
         if duration <= 0:
             return
         for name, motor in self.motors.items():
-            if motor.speed:
-                hall = not (self.extruder_active and not self.grip)
-                self._move(name, motor.speed * duration, hall=hall)
+            speed = self._motor_speed(motor)
+            if not speed:
+                continue
+            distance = speed * duration
+            target = getattr(motor, "stop_distance", None)
+            if target is not None:
+                remaining = max(0.0, target - motor._distance_travel)
+                distance = (1 if speed > 0 else -1) * min(abs(distance), remaining)
+                motor._distance_travel += abs(distance)
+            hall = not (self.extruder_active and not self.grip)
+            self._move(name, distance, hall=hall)
+            if target is not None and motor._distance_travel >= target:
+                motor.stop()
+            controller = getattr(motor, "hall_controller", None)
+            stop_ticks = getattr(motor, "_fake_stop_ticks", 0)
+            if stop_ticks and controller is not None and controller.hall_count >= stop_ticks:
+                controller.active = False
+                controller.target_speed = 0.0
+                motor._fake_stop_ticks = 0
+                motor._fake_mcu.report_status(motor, active=False)
 
     def extruder_move(self, distance, speed):
         lane = self.printer.reactor.canvas.lanes[
@@ -325,7 +502,7 @@ class Hardware:
             # Klipper's extruder and Canvas feeder run together; the feeder's
             # measured path movement is the simulated shared filament advance.
             self.reactor.pause(self.reactor.now + abs(distance) / max(speed, 0.01))
-            if not any(m.speed for m in self.motors.values()):
+            if not any(self._motor_speed(m) for m in self.motors.values()):
                 self._move(lane.name, distance, hall=False)
         finally:
             self.extruder_active = False
@@ -358,8 +535,6 @@ def make_config(printer, **overrides):
             "lane_%s_motor" % name: name,
             "lane_%s_present_pin" % name: "present_" + name,
             "lane_%s_prep_pin" % name: "prep_" + name,
-            "lane_%s_odometer_pin" % name: "hall_" + name,
-            "lane_%s_odometer_mm_per_pulse" % name: 0.5,
             "lane_%s_load_speed" % name: 20.0,
             "lane_%s_load_max_distance" % name: 40.0,
             "lane_%s_load_timeout" % name: 0.5,
@@ -380,6 +555,7 @@ def make_canvas(**overrides):
         printer.hardware.set_pin("present_" + name, True)
     canvas = Canvas(make_config(printer, **overrides))
     printer.reactor.canvas = canvas
+    canvas._handle_connect()
     return printer, canvas
 
 
@@ -437,8 +613,9 @@ def test_toolchange_unloads_old_lane_and_loads_new_lane():
 def test_config_requires_extruder_and_toolhead_sensor():
     printer = FakePrinter()
     del printer.objects["extruder"]
+    canvas = Canvas(make_config(printer))
     with pytest.raises(ConfigError, match="extruder"):
-        Canvas(make_config(printer))
+        canvas._handle_connect()
 
     printer = FakePrinter()
     del printer.objects["filament_switch_sensor toolhead"]
@@ -527,6 +704,7 @@ def test_saved_state_is_restored_and_reconciled_from_sensor():
         "variables": printer.save_vars}
     restored = Canvas(make_config(printer))
     printer.reactor.canvas = restored
+    restored._handle_connect()
     restored._handle_ready()
     assert restored.active_tool == 2
     assert restored.loaded["T2"]
@@ -539,6 +717,53 @@ def test_unload_rejects_wrong_lane_while_toolhead_sensor_is_occupied():
         run_command(printer, "CANVAS_UNLOAD", {"TOOL": 1})
     assert printer.hardware.motors["T1"].speed == 0
     assert canvas.active_tool == 0
+
+
+def test_canvas_uses_real_drv8833_host_module_with_simulated_mcu():
+    project = Path(__file__).resolve().parents[2]
+    driver_path = project / "klipper" / "klippy" / "extras" / "drv8833.py"
+    spec = importlib.util.spec_from_file_location("canvas_test_drv8833", driver_path)
+    driver_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(driver_module)
+
+    printer = FakePrinter()
+    printer.hardware.motors.clear()
+    mcu = FakeMCU()
+    printer.objects["pins"] = FakePins(mcu)
+    for name in LANE_NAMES:
+        printer.objects.pop("drv8833 " + name)
+        values = {
+            "_name": "drv8833 " + name,
+            "motor_fwd": "gpio%d" % (int(name[1:]) * 3),
+            "motor_rwd": "gpio%d" % (int(name[1:]) * 3 + 1),
+            "motor_hall": "gpio%d" % (int(name[1:]) * 3 + 2),
+            "motor_hall_resolution": 0.5,
+        }
+        driver = driver_module.PrinterDrv8833(FakeConfig(printer, values))
+        printer.objects["drv8833 " + name] = driver
+        printer.hardware.motors[name] = driver
+        mcu.bind_driver(driver)
+    mcu.build_config()
+
+    canvas = Canvas(make_config(printer))
+    printer.reactor.canvas = canvas
+    canvas._handle_connect()
+    for name in LANE_NAMES:
+        printer.hardware.set_pin("present_" + name, True)
+    run_command(printer, "CANVAS_TOOL_SELECT", {"TOOL": 0})
+
+    motor = printer.objects["drv8833 T0"]
+    status = motor.get_status(printer.reactor.monotonic())
+    assert type(motor).__module__ == "canvas_test_drv8833"
+    assert status["hall_count"] > 0
+    assert status["hall_distance"] >= canvas.grip_min_distance
+    lane_status = canvas.get_status()["lanes"]["T0"]
+    assert lane_status["odometer_count"] > 0
+    assert lane_status["odometer_mm"] >= canvas.grip_min_distance
+
+    run_command(printer, "CANVAS_UNLOAD", {"TOOL": 0, "METHOD": "tip_forming"})
+    assert not canvas.get_status()["toolhead_present"]
+    assert not motor.get_status(printer.reactor.monotonic())["active"]
 
 
 def test_reset_refuses_to_forget_filament_at_toolhead():

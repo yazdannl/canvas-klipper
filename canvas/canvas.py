@@ -15,8 +15,8 @@ class CanvasError(Exception):
 
 
 class CanvasLane:
-    def __init__(self, name, motor, present_pin, prep_pin, odometer_pin,
-                 odometer_mm_per_pulse, load_speed, load_max_distance,
+    def __init__(self, name, motor, present_pin, prep_pin,
+                 load_speed, load_max_distance,
                  load_timeout, prep_max_distance, prep_timeout,
                  unload_speed, unload_max_distance, unload_timeout,
                  park_distance, park_speed):
@@ -24,8 +24,6 @@ class CanvasLane:
         self.motor = motor
         self.present_pin = present_pin
         self.prep_pin = prep_pin
-        self.odometer_pin = odometer_pin
-        self.odometer_mm_per_pulse = odometer_mm_per_pulse
         self.load_speed = load_speed
         self.load_max_distance = load_max_distance
         self.load_timeout = load_timeout
@@ -39,19 +37,33 @@ class CanvasLane:
         self.present = False
         self.prep = False
         self.odometer_count = 0
-        self._odometer_high = False
+        self._odometer_mm = 0.0
+        self._last_hall_count = 0
+        self._last_hall_distance = 0.0
 
-    def odometer_callback(self, eventtime, state):
-        state = bool(state)
-        if state and not self._odometer_high:
-            self.odometer_count += 1
-        self._odometer_high = state
+    def update_odometer(self, eventtime):
+        status = self.motor.get_status(eventtime)
+        count = int(status["hall_count"])
+        distance = float(status["hall_distance"])
+        if count < self._last_hall_count or distance < self._last_hall_distance:
+            self.odometer_count += count
+            self._odometer_mm += max(0.0, distance)
+        else:
+            self.odometer_count += count - self._last_hall_count
+            self._odometer_mm += max(0.0, distance - self._last_hall_distance)
+        self._last_hall_count = count
+        self._last_hall_distance = distance
+        return status
 
-    def reset_odometer(self):
+    def reset_odometer(self, eventtime):
+        status = self.motor.get_status(eventtime)
         self.odometer_count = 0
+        self._odometer_mm = 0.0
+        self._last_hall_count = int(status["hall_count"])
+        self._last_hall_distance = float(status["hall_distance"])
 
     def odometer_distance(self):
-        return self.odometer_count * self.odometer_mm_per_pulse
+        return self._odometer_mm
 
 
 class Canvas:
@@ -66,9 +78,8 @@ class Canvas:
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object("gcode")
-        self.extruder = self.printer.lookup_object("extruder", None)
-        if self.extruder is None:
-            raise config.error("[canvas] requires a configured [extruder]")
+        self.extruder = None
+        self.config = config
 
         self.sensor_name = config.get("toolhead_sensor", "").strip()
         if not self.sensor_name:
@@ -118,19 +129,18 @@ class Canvas:
         for index, name in enumerate(LANE_NAMES):
             motor_name = config.get("lane_%s_motor" % (name,)).strip()
             motor = self.printer.lookup_object("drv8833 " + motor_name, None)
-            if motor is None or not callable(
-                    getattr(motor, "drv8833_set_speed", None)):
+            if motor is None or not all(callable(getattr(motor, method, None))
+                                         for method in (
+                                             "drv8833_set_speed", "drv8833_move",
+                                             "stop", "get_status")):
                 raise config.error(
-                    "lane_%s_motor must name an existing [drv8833 NAME] object"
-                    % (name,))
+                    "lane_%s_motor must name an existing [drv8833 NAME] object "
+                    "with the supported host API" % (name,))
             lane = CanvasLane(
                 name=name,
                 motor=motor,
                 present_pin=config.get("lane_%s_present_pin" % name),
                 prep_pin=config.get("lane_%s_prep_pin" % name),
-                odometer_pin=config.get("lane_%s_odometer_pin" % name),
-                odometer_mm_per_pulse=config.getfloat(
-                    "lane_%s_odometer_mm_per_pulse" % name, above=0.0),
                 load_speed=config.getfloat("lane_%s_load_speed" % name, 40.0,
                                            above=0.0),
                 load_max_distance=config.getfloat(
@@ -169,8 +179,6 @@ class Canvas:
             self.buttons.register_buttons(
                 [lane.prep_pin],
                 lambda eventtime, state, l=lane: setattr(l, "prep", bool(state)))
-            self.buttons.register_buttons(
-                [lane.odometer_pin], lane.odometer_callback)
         if self.hub_tangle_pin is not None:
             self.hub_tangle = False
             self.buttons.register_buttons(
@@ -195,6 +203,7 @@ class Canvas:
         self._load_saved_state()
         self.save_variables = self.printer.lookup_object("save_variables", None)
         self._register_commands()
+        self.printer.register_event_handler("klippy:connect", self._handle_connect)
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self.printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
         self.printer.register_event_handler(
@@ -259,6 +268,11 @@ class Canvas:
         for index, name in enumerate(LANE_NAMES):
             self.loaded[name] = bool(variables.get("canvas_loaded_%d" % index, False))
 
+    def _handle_connect(self):
+        self.extruder = self.printer.lookup_object("extruder", None)
+        if self.extruder is None:
+            raise self.config.error("[canvas] requires a configured [extruder]")
+
     def _handle_ready(self):
         present = self._toolhead_present()
         if self.active_tool is not None:
@@ -290,7 +304,7 @@ class Canvas:
     def _stop_all(self):
         for lane in self.lanes.values():
             try:
-                lane.motor.drv8833_set_speed(0.0)
+                lane.motor.stop()
             except Exception:
                 pass
 
@@ -344,12 +358,13 @@ class Canvas:
     def _drive_until(self, lane, speed, sensor_test, target, max_distance, timeout):
         if sensor_test() == target:
             return 0.0
-        lane.reset_odometer()
+        lane.reset_odometer(self.reactor.monotonic())
         deadline = self.reactor.monotonic() + timeout
         lane.motor.drv8833_set_speed(speed if target else -speed)
         try:
             while True:
                 self._ensure_not_cancelled()
+                lane.update_odometer(self.reactor.monotonic())
                 if sensor_test() == target:
                     return lane.odometer_distance()
                 distance = lane.odometer_distance()
@@ -364,23 +379,33 @@ class Canvas:
                         lane.name)
                 self.reactor.pause(min(deadline, now + DEFAULT_POLL_INTERVAL))
         finally:
-            lane.motor.drv8833_set_speed(0.0)
+            lane.motor.stop()
+            lane.update_odometer(self.reactor.monotonic())
 
     def _drive_distance(self, lane, distance, speed, timeout):
         if distance == 0:
             return
-        lane.reset_odometer()
+        lane.reset_odometer(self.reactor.monotonic())
         deadline = self.reactor.monotonic() + timeout
-        lane.motor.drv8833_set_speed(speed if distance > 0 else -speed)
+        lane.motor.drv8833_move(speed, distance, wait_for_completion=False)
         try:
-            while lane.odometer_distance() < abs(distance):
+            while True:
                 self._ensure_not_cancelled()
                 now = self.reactor.monotonic()
+                status = lane.update_odometer(now)
+                if lane.odometer_distance() >= abs(distance):
+                    return
+                if not status["active"]:
+                    raise CanvasError(
+                        "%s Hall-limited move stopped short (%.2f of %.2f mm)" %
+                        (lane.name, lane.odometer_distance(), abs(distance)))
                 if now >= deadline:
                     raise CanvasError("%s Hall odometry timed out" % lane.name)
                 self.reactor.pause(min(deadline, now + DEFAULT_POLL_INTERVAL))
         finally:
-            lane.motor.drv8833_set_speed(0.0)
+            if lane.motor.get_status(self.reactor.monotonic())["active"]:
+                lane.motor.stop()
+            lane.update_odometer(self.reactor.monotonic())
 
     def _extrude(self, distance, speed):
         self._hotend_ready()
@@ -414,7 +439,7 @@ class Canvas:
                 self._drive_until(
                     lane, lane.load_speed, self._toolhead_present, True,
                     lane.load_max_distance, lane.load_timeout)
-                start_count = lane.odometer_count
+                lane.reset_odometer(self.reactor.monotonic())
                 coordinated_speed = min(lane.load_speed, self.extruder_feed_speed)
                 if self.extruder_feed_length > lane.load_max_distance:
                     raise CanvasError(
@@ -425,8 +450,9 @@ class Canvas:
                     self._extrude(self.extruder_feed_length,
                                   self.extruder_feed_speed)
                 finally:
-                    lane.motor.drv8833_set_speed(0.0)
-                gripped = (lane.odometer_count - start_count) * lane.odometer_mm_per_pulse
+                    lane.motor.stop()
+                lane.update_odometer(self.reactor.monotonic())
+                gripped = lane.odometer_distance()
                 if not self._toolhead_present():
                     raise CanvasError(
                         "%s toolhead sensor cleared during extruder feed" % lane.name)
@@ -441,7 +467,7 @@ class Canvas:
                 return
             except CanvasError as error:
                 last_error = error
-                lane.motor.drv8833_set_speed(0.0)
+                lane.motor.stop()
                 if self.cancel_requested or self.printer.is_shutdown():
                     raise
                 if attempt + 1 < self.load_attempts and self.load_recovery_distance:
@@ -518,13 +544,15 @@ class Canvas:
             raise CanvasError(
                 "configured extruder retract exceeds %s Hall-distance bound" %
                 lane.name)
+        lane.reset_odometer(self.reactor.monotonic())
         lane.motor.drv8833_set_speed(
             -min(lane.unload_speed, self.extruder_retract_speed))
         try:
             self._extrude(-self.extruder_retract_length,
                           self.extruder_retract_speed)
         finally:
-            lane.motor.drv8833_set_speed(0.0)
+            lane.motor.stop()
+        lane.update_odometer(self.reactor.monotonic())
         self._drive_until(
             lane, lane.unload_speed, self._toolhead_present, False,
             lane.unload_max_distance, lane.unload_timeout)
@@ -603,14 +631,14 @@ class Canvas:
     def get_status(self, eventtime=None):
         lanes = {}
         for name, lane in self.lanes.items():
+            motor_status = lane.update_odometer(eventtime)
             lanes[name] = {
                 "present": lane.present,
                 "prep": lane.prep,
                 "loaded": self.loaded[name],
                 "odometer_count": lane.odometer_count,
                 "odometer_mm": lane.odometer_distance(),
-                "motor": lane.motor.get_status(eventtime)
-                if callable(getattr(lane.motor, "get_status", None)) else {},
+                "motor": motor_status,
             }
         return {
             "active_tool": self.active_tool,
