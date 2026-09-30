@@ -1,0 +1,5 @@
+# Exact tested source commits; update intentionally and re-run all simulation builds.
+klipper https://github.com/Klipper3d/klipper.git 7bc4d09465d31cd30fc0822e8d0abe02cc8c547f
+katapult https://github.com/Arksine/katapult.git ec59b9bb9ad6c2ec8d4dc6831fbc77f0b308e29e
+mcu-flasher https://github.com/OpenCentauri/OpenCentauri.git c921b0fc40fb64bd6d677c75a976a07324112096
+cosmos-reference https://github.com/OpenCentauri/cosmos.git 31cf90991d835b7390f52d73753558edb033d1f4
