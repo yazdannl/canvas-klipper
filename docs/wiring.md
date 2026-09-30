@@ -1,14 +1,63 @@
-# CANVAS wiring: known facts and measurements required
+# CANVAS wiring: known facts, published pin map, and what you must still verify
+
+## Pin values and where they come from
+
+Every pin value this project ships is in **[canvas-pins.md](canvas-pins.md)**, one table per
+function group, with the source URL and a confidence value (`confirmed-in-source`, `inferred`,
+`unknown`) for each. Read that document before touching a wire or running a load. Summary:
+
+- Confirmed in the source and filled into `config/canvas.cfg`: the four lane `motor_fwd` /
+  `motor_rwd` / `motor_hall` pins and `motor_hall_resolution` (0.26242), the four per-lane
+  filament (`prep`) switches, and the toolhead cutter-actuation input.
+- Confirmed in the source but living on the **printer's toolhead board**, not the CANVAS mainboard:
+  the toolhead/hub switch, the shared tangle input and the cover sensor. See
+  `config/canvas_toolhead_example.cfg`.
+- Still unknown and left `TO_BE_MEASURED`: the four per-lane `lane_T*_present_pin` switches.
 
 ## Known from published sources
 
-- CANVAS v1 is a four-lane feeder with four motor-driver channels and mechanical lane-present switches.
-- CC1 CANVAS documentation identifies a GD32F303RCT6 and four AT8833 (DRV8833-clone) H-bridges.
-- COSMOS runs a USB-serial Klipper MCU after firmware conversion, using PA11/PA12 for USB in its F401-target config. This does not establish the stock cable pinout or power arrangement.
-- The host driver's three required pins (`motor_fwd`, `motor_rwd`, `motor_hall`) and all lane-switch pins are not mapped in the public source tree consulted here. No generic pin assignments are supplied.
+- CANVAS v1 is a four-lane feeder with one motor channel per lane and mechanical lane filament
+  switches.
+- The CC1 CANVAS mainboard is marked **GD32F303RCT6** with **4× AT8833** (DRV8833 clone)
+  H-bridges; COSMOS builds and flashes `stm32f401xc` Klipper firmware onto it and the printer
+  talks to it over USB (24V, GND, 5V, D−, D+ on the 5-pin CANVAS port). The silicon and the
+  firmware target therefore do not match by name — a successful build is not proof your board
+  matches. See [canvas-pins.md](canvas-pins.md) §8.
+- The lane pin map itself comes from the CANVAS configuration COSMOS ships in
+  `klipper-readonly/canvas.cfg`; OpenCentauri's own AMS documentation calls that file "the only
+  worked example available on COSMOS". Values are *confirmed-in-source*, not hardware-verified.
+- The toolhead, tangle, cutter and cover sensors are on the CC1 CANVAS **toolhead** board (its
+  own Klipper MCU, named `hotend` by COSMOS). No `canvas:`-prefixed equivalents exist.
+- No public source publishes a second, spool-end "lane present" switch per lane.
 
 ## The user must measure/verify on the exact board
 
-Before connecting anything, record board revision and top-marked MCU, identify each connector contact with a schematic/continuity measurements, and determine which contacts are USB D+/D−, ground, VBUS, logic power and motor supply. Measure rails/logic levels and verify isolation/back-power behavior. Map each lane's two H-bridge inputs, Hall output, lane-present switch, polarity and pull-up requirements. Record toolhead/cutter/tangle sensors separately; they are not automatically on the Canvas MCU. Verify PWM-capable pins, Hall electrical type/edge behavior and actual motor topology before creating Klipper config.
+Before connecting anything, record board revision and top-marked MCU, identify each connector
+contact with a schematic/continuity measurements, and determine which contacts are USB D+/D−,
+ground, VBUS, logic power and motor supply. Measure rails/logic levels and verify
+isolation/back-power behavior. Then, for every value marked *confirmed-in-source* above, check
+that it is really your board's mapping:
 
-Do not infer pinout or voltage from connector shape, CC1 toolhead-board labels, or another board revision. Do not connect CAN, RS-485, 24 V, or an unknown power rail to host USB. Do not attach a host or printer until the pin map and supply arrangement have been independently checked. Use a correctly keyed/isolated adapter and an isolated bench setup with no filament and no active print. Firmware compile success and simulation tests do not validate electrical behavior.
+- Confirm each lane's H-bridge pair drives that lane's motor in the feed direction this project
+  expects. For lanes `T1` and `T3` the source's own alias table swaps FWD/RWD relative to the
+  `[drv8833]` sections ([canvas-pins.md](canvas-pins.md) §8 item 1); swap the two values if a lane
+  runs backwards.
+- Confirm `motor_hall_resolution: 0.26242` on your unit. It scales every Hall-bounded distance, so
+  a wrong value distorts load/unload safety bounds.
+- Confirm polarity and pull-up requirement for `canvas:PA8` / `PC7` / `PC11` / `PC0` (per-lane
+  filament switches) and for the toolhead switch, and confirm the actual sensor behind
+  `hotend:PB0` before enabling `hub_tangle_pin` (the sources disagree on its label).
+- Resolve `lane_T*_present_pin`. No source documents such a switch. Do **not** point it at the
+  prep pin: the lane-present guard is checked before the motor turns, so that combination refuses
+  every load. Either fit and measure your own switches or change the control extra to make the key
+  optional.
+- Verify PWM-capable pins, Hall electrical type/edge behavior and actual motor topology, and
+  measure the cutter actuation sense, macros, timeouts and retraction distances. Those are
+  motion/safety parameters; no published source covers them.
+
+Do not infer pinout or voltage from connector shape, from another board revision, or from the CC2
+CANVAS map (a different board, listed separately in [canvas-pins.md](canvas-pins.md) §8 item 5).
+Do not connect CAN, RS-485, 24 V, or an unknown power rail to host USB. Do not attach a host or
+printer until the pin map and supply arrangement have been independently checked. Use a correctly
+keyed/isolated adapter and an isolated bench setup with no filament and no active print. Firmware
+compile success and simulation tests do not validate electrical behavior.

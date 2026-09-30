@@ -2,7 +2,9 @@
 
 Standalone Klipper control and firmware support for an Elegoo CANVAS v1 four-lane feeder. It has no AFC or Happy-Hare runtime dependency.
 
-> **Status: experimental, simulation-tested only, not hardware-verified.** No generic pinout, motor calibration, cutter configuration, or firmware recovery path is certified by this project.
+> **Status: experimental, simulation-tested only, not hardware-verified.** No motor calibration, cutter configuration, or firmware recovery path is certified by this project.
+
+> **Pin map: filled from published sources, never measured by this project.** The CANVAS v1 (CC1) lane motor/Hall pins, lane filament switches and the toolhead/cutter inputs are taken from the CANVAS configuration COSMOS ships plus OpenCentauri's hardware documentation. Every value, its source URL and its confidence are listed in [docs/canvas-pins.md](docs/canvas-pins.md); the four `lane_T*_present_pin` switches remain unknown and stay `TO_BE_MEASURED`.
 
 ## Safety warning — read before connecting or flashing
 
@@ -15,17 +17,18 @@ There is an unresolved silicon/configuration discrepancy: hardware notes identif
 - A CANVAS v1 unit with its matching custom Klipper firmware and four DRV8833-compatible H-bridge/Hall channels.
 - Klipper on Linux; upstream Klipper is the target. `firmware/versions.lock` pins the build inputs.
 - A configured `[extruder]` **and** a toolhead `[filament_switch_sensor ...]` are mandatory. Canvas config fails if either is absent.
-- Four measured lane motor mappings, lane-present and prep switches, calibrated motor Hall resolution, plus a printer-specific cutter macro or a selected tip-forming strategy.
-- Sensor polarity, power and pin names must be measured on the exact hardware; example CANVAS pins are intentionally not guessed.
+- Lane motor mappings, lane prep switches and motor Hall resolution as published in [docs/canvas-pins.md](docs/canvas-pins.md) — use them, then verify them on your exact board.
+- A lane-present switch per lane, which **no public source documents**: measure your own or change the control extra to make the key optional.
+- A printer-specific cutter macro or a selected tip-forming strategy, plus measured sensor polarity, feed/retract distances and cutter sense.
 
 ## Quick start
 
-Read [wiring](docs/wiring.md), [firmware](docs/firmware.md), [flashing/recovery](docs/flashing.md), and [control usage](docs/usage.md) before connecting hardware. This project remains experimental and software/simulation-tested only.
+Read [CANVAS pin map](docs/canvas-pins.md), [wiring](docs/wiring.md), [firmware](docs/firmware.md), [flashing/recovery](docs/flashing.md), and [control usage](docs/usage.md) before connecting hardware. This project remains experimental and software/simulation-tested only.
 
 1. `./canvas-klipper.sh flash` — checks Moonraker print state, builds missing/stale pinned outputs (offers apt dependency installation when needed), detects the USB device, then stages Katapult and Klipper. The default detection asks you to unplug/replug the unit; `--device PATH` or `--vid-pid VVVV:PPPP` can select it explicitly. Flashing prints the GD32F303 vs STM32F401 warning and requires one exact typed risk phrase. No stock flash-backup tooling/image is available; recovery may require SWD. Optional verified files: `--backup-file PATH --recovery-file PATH`. `--dry-run` does not query Moonraker or open serial; `--yes --i-understand-the-risks` is the non-interactive authorization pair.
-2. `./canvas-klipper.sh install` — detects Klipper/config directories (or `--klipper-dir`/`--config-dir`), links host extras, copies config templates to `<config>/canvas/`, auto-fills the Canvas MCU serial, asks which existing filament switch is the toolhead sensor (or asks for a pin and generates the section), asks for the separation method, and registers the Moonraker update manager. Every prompt has a non-interactive flag counterpart (`--serial`, `--toolhead-sensor`, `--toolhead-pin`, `--separation-method`, `--non-interactive`). Before changing `printer.cfg` or `moonraker.conf` it creates a unique timestamped `.bak`; reruns are idempotent and never duplicate includes, sections or symlinks. Because the distributed template intentionally has `TO_BE_MEASURED` pins, the first run leaves `[include canvas/*.cfg]` **out of `printer.cfg`** (so Klipper still starts), defers the restart, and prints exactly what to fill in. Rerunning after the pins are set activates the include and restarts Klipper/Moonraker only when Moonraker reports idle. It refuses `printing`/`paused`, and unknown state unless `--force`.
+2. `./canvas-klipper.sh install` — detects Klipper/config directories (or `--klipper-dir`/`--config-dir`), links host extras, copies config templates to `<config>/canvas/`, auto-fills the Canvas MCU serial, asks which existing filament switch is the toolhead sensor (or asks for a pin and generates the section), asks for the separation method, and registers the Moonraker update manager. Every prompt has a non-interactive flag counterpart (`--serial`, `--toolhead-sensor`, `--toolhead-pin`, `--separation-method`, `--non-interactive`). Before changing `printer.cfg` or `moonraker.conf` it creates a unique timestamped `.bak`; reruns are idempotent and never duplicate includes, sections or symlinks. The distributed template now ships the published lane motor/Hall pins, lane prep switches, Hall resolution and toolhead cutter input, but it still carries `TO_BE_MEASURED` for the four `lane_T*_present_pin` keys that no public source documents. While any `TO_BE_MEASURED` remains, `install` leaves `[include canvas/*.cfg]` **out of `printer.cfg`** (so Klipper still starts), defers the restart, and prints exactly what to fill in. Rerunning after the pins are set activates the include and restarts Klipper/Moonraker only when Moonraker reports idle. It refuses `printing`/`paused`, and unknown state unless `--force`.
 
-`install` will not guess Canvas pins or patch/build the Klipper MCU firmware. Review and measure every `TO_BE_MEASURED` setting, apply/build the documented MCU support as needed, and check the hardware/recovery mismatch before use. Uninstall/status are available as `./canvas-klipper.sh uninstall` and `./canvas-klipper.sh status`; see the [flashing](docs/flashing.md) and [usage](docs/usage.md) guides for flags and safety details.
+`install` will not guess Canvas pins or patch/build the Klipper MCU firmware. It still defers until every placeholder is a real value, so on a stock CC1 CANVAS it will not complete until you resolve the lane-present switches (see [docs/canvas-pins.md](docs/canvas-pins.md) §3). Check the hardware/recovery mismatch before use. Uninstall/status are available as `./canvas-klipper.sh uninstall` and `./canvas-klipper.sh status`; see the [flashing](docs/flashing.md) and [usage](docs/usage.md) guides for flags and safety details.
 
 ## Commands
 
@@ -49,6 +52,7 @@ The simulator suite includes a test against the real `klipper/klippy/extras/drv8
 
 ## Documentation and provenance
 
+- [CANVAS v1 pin map, sources and confidence](docs/canvas-pins.md)
 - [Control-layer setup and usage](docs/usage.md)
 - [Wiring and safety](docs/wiring.md)
 - [Firmware build](docs/firmware.md)
