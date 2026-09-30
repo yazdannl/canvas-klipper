@@ -166,12 +166,12 @@ def normalize_include(text: str) -> str:
                      if line.strip().lower() != INCLUDE_LINE.lower())
 
 
-def canvas_settings(printer_cfg: Path) -> dict[str, dict[str, str]]:
+def canvas_settings(paths) -> dict[str, dict[str, str]]:
     settings: dict[str, dict[str, str]] = {}
     current = None
     seen_sections: set[str] = set()
     duplicate_sections = False
-    for path in included_files(printer_cfg):
+    for path in paths:
         for line in path.read_text(encoding="utf-8").splitlines():
             header = re.fullmatch(r"\s*\[([^]\n]+)\]\s*(?:#.*)?", line)
             if header:
@@ -191,8 +191,17 @@ def canvas_settings(printer_cfg: Path) -> dict[str, dict[str, str]]:
     return settings
 
 
-def canvas_config_complete(printer_cfg: Path) -> bool:
-    settings = canvas_settings(printer_cfg)
+def config_paths(printer_cfg: Path, canvas_cfg: Path) -> list[Path]:
+    """printer.cfg includes plus the Canvas scaffold, even while its include is inactive."""
+    paths = included_files(printer_cfg)
+    if canvas_cfg.is_file() and canvas_cfg.resolve() not in {p.resolve() for p in paths}:
+        paths = [canvas_cfg, *paths]
+    return paths
+
+
+def canvas_config_complete(printer_cfg: Path, canvas_cfg: Path) -> bool:
+    """True only when every placeholder pin Klipper needs is a measured value."""
+    settings = canvas_settings(config_paths(printer_cfg, canvas_cfg))
     if "__duplicate_sections__" in settings:
         return False
     canvas = settings.get("canvas", {})
@@ -428,6 +437,9 @@ def flash(args) -> int:
         raise ValueError("--yes requires --i-understand-the-risks")
     if not args.dry_run and args.non_interactive and not args.yes:
         raise ValueError("--non-interactive flash requires --yes --i-understand-the-risks")
+    backups = [args.backup_file, args.recovery_file]
+    if bool(backups[0]) != bool(backups[1]):
+        raise ValueError("--backup-file and --recovery-file must be supplied together")
     if args.dry_run:
         # Dry-run remains fully offline and does not inspect devices, Moonraker or run builders.
         outputs = (ROOT / "firmware/build-output/katapult-deployer-canvas.bin",
@@ -487,8 +499,6 @@ def flash(args) -> int:
             raise ValueError("confirmation did not match")
 
     backups = [args.backup_file, args.recovery_file]
-    if bool(backups[0]) != bool(backups[1]):
-        raise ValueError("--backup-file and --recovery-file must be supplied together")
     common = ["--device", first_device, "--execute", "--i-understand-the-risks", "--yes"]
     if backups[0]:
         common += ["--stock-backup", backups[0], "--recovery-image", backups[1]]
@@ -550,7 +560,7 @@ def install(args) -> int:
         sensor_pin = None
     else:
         sensor = args.toolhead_sensor or "canvas_toolhead"
-        if args.non_interactive and not args.toolhead_sensor:
+        if args.non_interactive and not (args.toolhead_sensor and args.toolhead_pin):
             raise ValueError("--non-interactive with no existing sensor requires --toolhead-sensor and --toolhead-pin")
         sensor_pin = ask("Pin for new [filament_switch_sensor %s]: " % sensor,
                          non_interactive=args.non_interactive, value=args.toolhead_pin)
@@ -564,9 +574,6 @@ def install(args) -> int:
         raise ValueError("separation method must be cutter or tip_forming")
 
     old_printer = printer_cfg.read_text(encoding="utf-8")
-    new_printer = old_printer
-    if not any(line.strip().lower() == INCLUDE_LINE.lower() for line in old_printer.splitlines()):
-        new_printer = old_printer.rstrip() + "\n\n" + INCLUDE_LINE + "\n"
     old_moonraker = moonraker_cfg.read_text(encoding="utf-8")
     block = update_manager_section(ROOT)
     existing = section_block(old_moonraker, "update_manager canvas-klipper")
@@ -588,21 +595,37 @@ def install(args) -> int:
                                        not canvas_config.read_text(encoding="utf-8").startswith(MANAGED_HEADER)):
             raise ValueError("Refusing to overwrite unmarked user file: " + str(canvas_config))
 
-    if new_printer != old_printer:
-        saved = backup_path(printer_cfg)
-        print("Backup: " + str(saved))
     if new_moonraker != old_moonraker:
         saved = backup_path(moonraker_cfg)
         print("Backup: " + str(saved))
     subprocess.run(["bash", str(ROOT / "install.sh")], check=True,
                    env={**os.environ, "KLIPPER_DIR": str(klipper)})
     canvas_changed = copy_templates(config_dir, sensor, method, serial, sensor_pin)
+    canvas_cfg = canvas_dir / "canvas.cfg"
+    complete = canvas_config_complete(printer_cfg, canvas_cfg)
+    include_active = any(line.strip().lower() == INCLUDE_LINE.lower() for line in old_printer.splitlines())
+    new_printer = old_printer
+    if complete and not include_active:
+        # Only a fully measured config may be pulled into printer.cfg; a scaffold
+        # with placeholder pins would stop Klipper from starting.
+        new_printer = old_printer.rstrip() + "\n\n" + INCLUDE_LINE + "\n"
     if new_printer != old_printer:
+        saved = backup_path(printer_cfg)
+        print("Backup: " + str(saved))
         printer_cfg.write_text(new_printer, encoding="utf-8")
     if new_moonraker != old_moonraker:
         moonraker_cfg.write_text(new_moonraker, encoding="utf-8")
-    if not canvas_config_complete(printer_cfg):
-        print("Canvas setup scaffold installed. Klipper restart deferred: add all measured drv8833 and lane pin settings, then rerun install.")
+    if not complete:
+        print("Canvas scaffold installed; Klipper restart deferred.")
+        if include_active:
+            print("WARNING: %s is already active in printer.cfg while pins are unmeasured; "
+                  "Klipper will refuse to start until the items below are filled in." % INCLUDE_LINE)
+        print("Fill in %s:" % canvas_cfg)
+        print("  - switch_pin for [filament_switch_sensor %s] (or your existing sensor)" % sensor)
+        print("  - lane_T0_motor, lane_T0_present_pin and lane_T0_prep_pin for T0..T3")
+        print("  - [drv8833 T0..T3] motor_fwd, motor_rwd, motor_hall and motor_hall_resolution")
+        print("Then rerun: %s install  (it activates %s and restarts Klipper/Moonraker only when idle)"
+              % (ROOT / "canvas-klipper.sh", INCLUDE_LINE))
         return 0
 
     previous_digest = marker.read_text(encoding="ascii").strip() if marker.is_file() else ""
@@ -661,6 +684,7 @@ def uninstall(args) -> int:
         saved = move_to_backup(canvas_dir)
         print("Preserved Canvas config directory as " + str(saved))
     print("Removed the include/update-manager entries after backups. User config files were preserved as .bak; no files were deleted.")
+    print("Restart Klipper/Moonraker yourself when the printer is idle; this command never restarts services.")
     return 0
 
 
