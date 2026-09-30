@@ -559,6 +559,18 @@ def make_canvas(**overrides):
     return printer, canvas
 
 
+def make_canvas_without_present_pin(**overrides):
+    """A canvas with no lane_T*_present_pin configured, as a stock CANVAS install would be."""
+    printer = FakePrinter()
+    config = make_config(printer, **overrides)
+    for name in LANE_NAMES:
+        del config.values["lane_%s_present_pin" % name]
+    canvas = Canvas(config)
+    printer.reactor.canvas = canvas
+    canvas._handle_connect()
+    return printer, canvas
+
+
 def run_command(printer, command, params=None):
     printer.gcode.commands[command](FakeGcmd(params or {}))
 
@@ -655,6 +667,80 @@ def test_empty_spool_and_stuck_toolhead_sensor_fail_safe():
     with pytest.raises(CanvasError, match="load failed"):
         run_command(printer, "CANVAS_LOAD", {"TOOL": 0})
     assert all(motor.speed == 0 for motor in printer.hardware.motors.values())
+
+
+def test_configured_present_pin_overrides_the_prep_switch():
+    """A configured lane-present switch is the only source of presence and still gates loads."""
+    printer, canvas = make_canvas(load_attempts=1)
+    assert canvas.lanes["T0"].present_source == "present_pin"
+    printer.hardware.present["T0"] = False
+    printer.hardware.set_pin("present_T0", False)
+    printer.hardware.set_pin("prep_T0", True)  # prep active must not fake presence
+    with pytest.raises(CanvasError, match="no filament"):
+        run_command(printer, "CANVAS_LOAD", {"TOOL": 0})
+    status = canvas.get_status()["lanes"]["T0"]
+    assert status["present"] is False and status["prep"] is True
+    assert status["present_source"] == "present_pin"
+    assert all(motor.speed == 0 for motor in printer.hardware.motors.values())
+
+
+def test_presence_is_derived_from_prep_when_no_present_pin_is_configured():
+    printer, canvas = make_canvas_without_present_pin()
+    lane = canvas.lanes["T0"]
+    assert lane.present_source == "prep"
+    assert lane.present is False  # prep switch reads empty: never report filament present
+    status = canvas.get_status()["lanes"]["T0"]
+    assert status["present"] is False and status["prep"] is False
+
+    run_command(printer, "CANVAS_LOAD", {"TOOL": 0})
+    assert canvas.loaded["T0"]
+    assert canvas.lanes["T0"].prep is True
+    assert canvas.lanes["T0"].present is True  # follows the prep switch, not the reverse
+    status = canvas.get_status()["lanes"]["T0"]
+    assert status["present"] is True and status["present_source"] == "prep"
+
+
+def test_canvas_status_reports_derived_presence_source():
+    printer, canvas = make_canvas_without_present_pin()
+    gcmd = FakeGcmd()
+    printer.gcode.commands["CANVAS_STATUS"](gcmd)
+    text = "\n".join(gcmd.info)
+    assert "T0 present=False(prep) prep=False" in text
+    run_command(printer, "CANVAS_LOAD", {"TOOL": 0})
+    gcmd = FakeGcmd()
+    printer.gcode.commands["CANVAS_STATUS"](gcmd)
+    assert "T0 present=True(prep) prep=True" in "\n".join(gcmd.info)
+
+
+def test_derived_presence_still_fails_safe_when_the_prep_switch_never_triggers():
+    printer, canvas = make_canvas_without_present_pin(load_attempts=1)
+    printer.hardware.prep_stuck["T0"] = False
+    with pytest.raises(CanvasError, match="no lane-present switch is configured"):
+        run_command(printer, "CANVAS_LOAD", {"TOOL": 0})
+    assert all(motor.speed == 0 for motor in printer.hardware.motors.values())
+    assert canvas.get_status()["lanes"]["T0"]["present"] is False
+    assert not canvas.loaded["T0"]
+
+
+def test_present_pin_still_gates_a_lane_whose_prep_switch_is_derived_active():
+    """Derivation applies only to the lanes that have no present switch configured."""
+    printer = FakePrinter()
+    config = make_config(printer, load_attempts=1)
+    for name in ("T1", "T2", "T3"):
+        del config.values["lane_%s_present_pin" % name]
+    canvas = Canvas(config)
+    printer.reactor.canvas = canvas
+    canvas._handle_connect()
+    assert [canvas.lanes[name].present_source for name in LANE_NAMES] == [
+        "present_pin", "prep", "prep", "prep"]
+
+    printer.hardware.present["T0"] = False
+    printer.hardware.set_pin("present_T0", False)
+    with pytest.raises(CanvasError, match="no filament"):
+        run_command(printer, "CANVAS_LOAD", {"TOOL": 0})
+    printer.hardware.set_pin("present_T0", True)
+    run_command(printer, "CANVAS_LOAD", {"TOOL": 1})
+    assert canvas.loaded["T1"] and canvas.lanes["T1"].present_source == "prep"
 
 
 def test_load_timeout_stops_lane():

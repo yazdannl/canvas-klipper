@@ -24,6 +24,12 @@ class CanvasLane:
         self.motor = motor
         self.present_pin = present_pin
         self.prep_pin = prep_pin
+        # A lane-present switch is optional. A stock CANVAS v1 board has no separate
+        # spool-end switch (docs/canvas-pins.md section 3), so when none is configured the
+        # lane's presence is derived from that lane's prep switch: presence can only ever
+        # be reported while the prep switch reads active, never the other way round.
+        self.present_from_prep = present_pin is None
+        self._present_state = False
         self.load_speed = load_speed
         self.load_max_distance = load_max_distance
         self.load_timeout = load_timeout
@@ -34,12 +40,40 @@ class CanvasLane:
         self.unload_timeout = unload_timeout
         self.park_distance = park_distance
         self.park_speed = park_speed
-        self.present = False
         self.prep = False
         self.odometer_count = 0
         self._odometer_mm = 0.0
         self._last_hall_count = 0
         self._last_hall_distance = 0.0
+
+    @property
+    def present(self):
+        """Filament presence for this lane, from its present switch or from its prep switch."""
+        if self.present_from_prep:
+            return self.prep
+        return self._present_state
+
+    @present.setter
+    def present(self, value):
+        self._present_state = bool(value)
+
+    @property
+    def present_source(self):
+        """Where the present state comes from: the configured switch, or the prep switch."""
+        return "prep" if self.present_from_prep else "present_pin"
+
+    def load_block_reason(self):
+        """Why this lane must not start a load, or None when it may.
+
+        A configured lane-present switch gates the load before any motion, exactly as
+        before. Without one the presence state is derived from the prep switch, which is
+        still clear while filament sits upstream of the lane, so it cannot gate the load up
+        front; the bounded move to the prep switch is then what proves the lane holds
+        filament, and a lane that reaches it stays guarded by that same switch.
+        """
+        if self.present_from_prep or self.present:
+            return None
+        return "%s has no filament at its lane-present switch" % self.name
 
     def update_odometer(self, eventtime):
         status = self.motor.get_status(eventtime)
@@ -139,7 +173,7 @@ class Canvas:
             lane = CanvasLane(
                 name=name,
                 motor=motor,
-                present_pin=config.get("lane_%s_present_pin" % name),
+                present_pin=self._optional_pin(config, "lane_%s_present_pin" % (name,)),
                 prep_pin=config.get("lane_%s_prep_pin" % name),
                 load_speed=config.getfloat("lane_%s_load_speed" % name, 40.0,
                                            above=0.0),
@@ -173,9 +207,10 @@ class Canvas:
 
         self.buttons = self.printer.load_object(config, "buttons")
         for lane in self.lanes.values():
-            self.buttons.register_buttons(
-                [lane.present_pin],
-                lambda eventtime, state, l=lane: setattr(l, "present", bool(state)))
+            if lane.present_pin is not None:
+                self.buttons.register_buttons(
+                    [lane.present_pin],
+                    lambda eventtime, state, l=lane: setattr(l, "present", bool(state)))
             self.buttons.register_buttons(
                 [lane.prep_pin],
                 lambda eventtime, state, l=lane: setattr(l, "prep", bool(state)))
@@ -208,6 +243,14 @@ class Canvas:
         self.printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
         self.printer.register_event_handler(
             "gcode:request_restart", self._handle_restart)
+
+    @staticmethod
+    def _optional_pin(config, key):
+        """Read an optional pin; unset, missing or empty means "not configured"."""
+        value = config.get(key, None)
+        if value is None or not str(value).strip():
+            return None
+        return str(value).strip()
 
     @staticmethod
     def _macro_name(config, key, default):
@@ -419,8 +462,9 @@ class Canvas:
                 "RESTORE_GCODE_STATE NAME=CANVAS_EXTRUSION")
 
     def _load_lane(self, lane):
-        if not lane.present:
-            raise CanvasError("%s has no filament at its lane-present switch" % lane.name)
+        blocked = lane.load_block_reason()
+        if blocked:
+            raise CanvasError(blocked)
         if self.hub_tangle:
             raise CanvasError("shared CANVAS hub/tangle sensor is active")
         if self._toolhead_present():
@@ -433,9 +477,17 @@ class Canvas:
         last_error = None
         for attempt in range(self.load_attempts):
             try:
-                self._drive_until(
-                    lane, lane.load_speed, lambda: lane.prep, True,
-                    lane.prep_max_distance, lane.prep_timeout)
+                try:
+                    self._drive_until(
+                        lane, lane.load_speed, lambda: lane.prep, True,
+                        lane.prep_max_distance, lane.prep_timeout)
+                except CanvasError as error:
+                    if not lane.present_from_prep:
+                        raise
+                    raise CanvasError(
+                        "%s; no lane-present switch is configured, so this usually "
+                        "means the lane is empty or its prep switch is not "
+                        "triggering" % (error,))
                 self._drive_until(
                     lane, lane.load_speed, self._toolhead_present, True,
                     lane.load_max_distance, lane.load_timeout)
@@ -608,6 +660,11 @@ class Canvas:
             "Canvas active=%s loaded=%s busy=%s toolhead=%s hub_tangle=%s" %
             (status["active_tool"], status["loaded"], status["busy"],
              status["toolhead_present"], status["hub_tangle"]))
+        gcmd.respond_info(
+            "Canvas lanes: " + "  ".join(
+                "%s present=%s(%s) prep=%s" % (name, lane["present"],
+                                               lane["present_source"], lane["prep"])
+                for name, lane in sorted(status["lanes"].items())))
 
     def cmd_CANVAS_RESET(self, gcmd):
         if self.busy:
@@ -634,6 +691,7 @@ class Canvas:
             motor_status = lane.update_odometer(eventtime)
             lanes[name] = {
                 "present": lane.present,
+                "present_source": lane.present_source,
                 "prep": lane.prep,
                 "loaded": self.loaded[name],
                 "odometer_count": lane.odometer_count,
