@@ -110,25 +110,28 @@ def test_install_fresh_and_rerun_are_safe_and_idempotent(tmp_path, monkeypatch, 
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("CANVAS_SERIAL_BY_ID_DIR", str(serial.parent))
     args = cli_install(klipper, config, moonraker, serial)
+    original_printer = (config / "printer.cfg").read_text()
 
     assert manager.install(args) == 0
     printer = (config / "printer.cfg").read_text()
     moon = (config / "moonraker.conf").read_text()
     generated = (config / "canvas/canvas.cfg").read_text()
-    assert printer.count("[include canvas/*.cfg]") == 1
+    # Placeholder pins are still unresolved, so the include must stay inactive.
+    assert printer == original_printer
+    assert "[include canvas/*.cfg]" not in printer
     assert "[update_manager canvas-klipper]" in moon
     assert "serial: %s" % serial in generated
     assert "toolhead_sensor: tool_sensor" in generated
     assert "separation_method: tip_forming" in generated
     assert "[filament_switch_sensor tool_sensor]" not in generated
     assert (klipper / "klippy/extras/canvas.py").is_symlink()
-    assert len(list(config.glob("printer.cfg.*.bak"))) == 1
+    assert not list(config.glob("printer.cfg.*.bak"))
     assert len(list(config.glob("moonraker.conf.*.bak"))) == 1
     assert manager.install(args) == 0
     assert (config / "printer.cfg").read_text() == printer
     assert (config / "moonraker.conf").read_text() == moon
     assert (config / "canvas/canvas.cfg").read_text() == generated
-    assert len(list(config.glob("printer.cfg.*.bak"))) == 1
+    assert not list(config.glob("printer.cfg.*.bak"))
     assert len(list(config.glob("moonraker.conf.*.bak"))) == 1
     assert not log.exists()  # incomplete pin scaffold is never restarted
 
@@ -142,9 +145,10 @@ def test_install_cli_runs_with_fake_home(tmp_path, monkeypatch, moonraker):
                "--non-interactive", "--toolhead-sensor", "tool_sensor", "--separation-method", "cutter"]
     result = subprocess.run(command, env=env, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
-    assert "[include canvas/*.cfg]" in (config / "printer.cfg").read_text()
+    assert "[include canvas/*.cfg]" not in (config / "printer.cfg").read_text()
     assert "separation_method: cutter" in (config / "canvas/canvas.cfg").read_text()
     assert "restart deferred" in result.stdout
+    assert "TO_BE_MEASURED" in result.stdout or "lane_T0_motor" in result.stdout
     assert not log.exists()  # the copied template has no measured lane pins yet
 
 
@@ -182,10 +186,15 @@ def test_restart_waits_for_measured_config_then_is_idempotent(tmp_path, monkeypa
     assert not log.exists()
     add_measured_pins(config)
     assert manager.install(args) == 0
+    printer = (config / "printer.cfg").read_text()
+    assert printer.count("[include canvas/*.cfg]") == 1
+    assert len(list(config.glob("printer.cfg.*.bak"))) == 1
     calls = log.read_text().splitlines()
     assert calls == ["systemctl restart klipper", "systemctl restart moonraker"]
     assert manager.install(args) == 0
+    assert (config / "printer.cfg").read_text() == printer
     assert log.read_text().splitlines() == calls
+    assert len(list(config.glob("printer.cfg.*.bak"))) == 1
 
 
 def test_install_refuses_printing_before_any_changes(tmp_path, monkeypatch, moonraker):
@@ -344,3 +353,207 @@ def test_flash_end_to_end_uses_existing_pty_bootloader_mock(tmp_path, monkeypatc
     finally:
         os.close(master)
         os.close(slave)
+
+
+def test_install_detects_single_serial_candidate_without_flag(tmp_path, monkeypatch, moonraker):
+    home, klipper, config, serial = fake_tree(tmp_path)
+    fake_commands(tmp_path, monkeypatch)
+    monkeypatch.setenv("CANVAS_SERIAL_BY_ID_DIR", str(serial.parent))
+    args = manager.make_parser().parse_args([
+        "install", "--klipper-dir", str(klipper), "--config-dir", str(config),
+        "--moonraker-url", moonraker, "--non-interactive", "--toolhead-sensor", "tool_sensor",
+        "--separation-method", "cutter"])
+    assert manager.install(args) == 0
+    assert "serial: %s" % serial in (config / "canvas/canvas.cfg").read_text()
+
+
+def test_install_requires_explicit_serial_when_candidates_are_ambiguous(tmp_path, monkeypatch, moonraker):
+    home, klipper, config, serial = fake_tree(tmp_path)
+    fake_commands(tmp_path, monkeypatch)
+    monkeypatch.setattr(manager, "serial_paths", lambda: [serial, config / "other"])
+    args = cli_install(klipper, config, moonraker, serial)
+    args.serial = None
+    with pytest.raises(ValueError, match="found 2"):
+        manager.install(args)
+
+
+def test_install_non_interactive_requires_pin_when_no_sensor_exists(tmp_path, monkeypatch, moonraker):
+    home, klipper, config, serial = fake_tree(tmp_path, sensor=False)
+    fake_commands(tmp_path, monkeypatch)
+    args = manager.make_parser().parse_args([
+        "install", "--klipper-dir", str(klipper), "--config-dir", str(config),
+        "--moonraker-url", moonraker, "--serial", str(serial), "--non-interactive",
+        "--toolhead-sensor", "canvas_toolhead", "--separation-method", "cutter"])
+    with pytest.raises(ValueError, match="toolhead-pin"):
+        manager.install(args)
+    assert not (config / "canvas").exists()
+
+
+def test_install_never_overwrites_user_edited_templates(tmp_path, monkeypatch, moonraker):
+    home, klipper, config, serial = fake_tree(tmp_path)
+    fake_commands(tmp_path, monkeypatch)
+    args = cli_install(klipper, config, moonraker, serial)
+    manager.install(args)
+    macros = config / "canvas/canvas_macros.cfg"
+    macros.write_text(macros.read_text() + "\n[gcode_macro MY_EDIT]\ngcode: M117 edited\n")
+    edited = macros.read_text()
+    assert manager.install(args) == 0
+    assert macros.read_text() == edited
+
+
+def test_install_refuses_to_overwrite_unmanaged_canvas_cfg(tmp_path, monkeypatch, moonraker):
+    home, klipper, config, serial = fake_tree(tmp_path)
+    fake_commands(tmp_path, monkeypatch)
+    canvas_dir = config / "canvas"
+    canvas_dir.mkdir()
+    user_file = canvas_dir / "canvas.cfg"
+    user_file.write_text("[canvas]\ntoolhead_sensor: mine\n")
+    args = cli_install(klipper, config, moonraker, serial)
+    with pytest.raises(ValueError, match="unmarked user file"):
+        manager.install(args)
+    assert user_file.read_text() == "[canvas]\ntoolhead_sensor: mine\n"
+
+
+def test_uninstall_never_restarts_services_and_keeps_unique_backups(tmp_path, monkeypatch, moonraker):
+    home, klipper, config, serial = fake_tree(tmp_path)
+    log = fake_commands(tmp_path, monkeypatch)
+    args = cli_install(klipper, config, moonraker, serial)
+    manager.install(args)
+    add_measured_pins(config)
+    manager.install(args)
+    printer_backup = next(iter(config.glob("printer.cfg.*.bak")))
+    saved = printer_backup.read_text()
+    uninstall_args = manager.make_parser().parse_args([
+        "uninstall", "--klipper-dir", str(klipper), "--config-dir", str(config),
+        "--moonraker-url", moonraker])
+    assert manager.uninstall(uninstall_args) == 0
+    assert manager.uninstall(uninstall_args) == 0  # idempotent, nothing left to change
+    backups = list(config.glob("printer.cfg.*.bak"))
+    assert len(backups) == len(set(backups))  # never overwrites an existing .bak
+    assert any(b.read_text() == saved for b in backups)
+    assert log.read_text().splitlines() == ["systemctl restart klipper", "systemctl restart moonraker"]
+
+
+def test_status_reports_installation_state(tmp_path, monkeypatch, moonraker, capsys):
+    home, klipper, config, serial = fake_tree(tmp_path)
+    fake_commands(tmp_path, monkeypatch)
+    monkeypatch.setenv("CANVAS_SERIAL_BY_ID_DIR", str(serial.parent))
+    args = cli_install(klipper, config, moonraker, serial)
+    manager.install(args)
+    status_args = manager.make_parser().parse_args([
+        "status", "--klipper-dir", str(klipper), "--config-dir", str(config),
+        "--moonraker-url", moonraker])
+    assert manager.status(status_args) == 0
+    out = capsys.readouterr().out
+    assert "canvas.py: linked" in out
+    assert "Moonraker print state: standby" in out
+
+
+def test_status_tolerates_unreachable_moonraker(tmp_path, monkeypatch, capsys):
+    home, klipper, config, serial = fake_tree(tmp_path)
+    args = manager.make_parser().parse_args([
+        "status", "--klipper-dir", str(klipper), "--config-dir", str(config),
+        "--moonraker-url", "http://127.0.0.1:1"])
+    assert manager.status(args) == 0
+    assert "Moonraker print state: unknown" in capsys.readouterr().out
+
+
+def test_flash_refuses_while_printing(tmp_path, monkeypatch, moonraker):
+    fake_commands(tmp_path, monkeypatch)
+    StateHandler.state = "printing"
+    args = manager.make_parser().parse_args(["flash", "--device", "/dev/null",
+                                            "--moonraker-url", moonraker])
+    with pytest.raises(ValueError, match="printing"):
+        manager.flash(args)
+
+
+def test_flash_refuses_unknown_moonraker_state_without_force(tmp_path, monkeypatch):
+    fake_commands(tmp_path, monkeypatch)
+    args = manager.make_parser().parse_args(["flash", "--device", "/dev/null",
+                                            "--moonraker-url", "http://127.0.0.1:1"])
+    with pytest.raises(ValueError, match="unknown"):
+        manager.flash(args)
+
+
+def test_flash_non_interactive_requires_explicit_risk_flags(moonraker):
+    args = manager.make_parser().parse_args(["flash", "--non-interactive",
+                                            "--moonraker-url", moonraker])
+    with pytest.raises(ValueError, match="--i-understand-the-risks"):
+        manager.flash(args)
+    with pytest.raises(ValueError, match="--i-understand-the-risks"):
+        manager.flash(manager.make_parser().parse_args(
+            ["flash", "--non-interactive", "--yes", "--moonraker-url", moonraker]))
+
+
+def test_flash_backup_and_recovery_flags_must_be_paired():
+    with pytest.raises(ValueError, match="must be supplied together"):
+        manager.flash(manager.make_parser().parse_args(
+            ["flash", "--dry-run", "--backup-file", "/tmp/does-not-exist.bin"]))
+
+
+def test_flash_dry_run_is_offline_and_needs_no_device(moonraker, capsys):
+    args = manager.make_parser().parse_args(["flash", "--dry-run", "--moonraker-url",
+                                             "http://127.0.0.1:1"])
+    assert manager.flash(args) == 0
+    out = capsys.readouterr().out
+    assert "DRY RUN" in out
+    assert "recovery may require SWD" in out
+
+
+def test_flash_device_override_rejects_missing_or_mismatched_device(tmp_path, monkeypatch):
+    monkeypatch.setattr(manager, "device_info", lambda _p: {
+        "vid_pid": "1234:5678", "vendor": "Canvas", "product": "Canvas"})
+    with pytest.raises(ValueError, match="does not exist"):
+        manager.detect_device(str(tmp_path / "missing"), None, prompt=False)
+    node = tmp_path / "ttyACM0"
+    node.touch()
+    assert manager.detect_device(str(node), "1234:5678", prompt=False) == (str(node), "1234:5678")
+    with pytest.raises(ValueError, match="identity mismatch"):
+        manager.detect_device(str(node), "dead:beef", prompt=False)
+
+
+def test_flash_rejects_two_new_devices_from_plug_diff(tmp_path, monkeypatch):
+    devices = [tmp_path / "a", tmp_path / "b"]
+    states = [[], devices]
+    monkeypatch.setattr(manager, "serial_paths", lambda: list(states.pop(0)))
+    monkeypatch.setattr(manager, "device_info", lambda _p: {
+        "vid_pid": "abcd:0001", "vendor": "ShenZhenCBD", "product": "Canvas"})
+    with pytest.raises(ValueError, match="2 new serial devices"):
+        manager.detect_device(None, None, input_fn=lambda _p: "", output=lambda _m: None)
+
+
+def test_flash_rejects_unverified_vendor_from_plug_diff(tmp_path, monkeypatch):
+    new_device = tmp_path / "ttyACM0"
+    new_device.touch()
+    states = [[], [new_device]]
+    monkeypatch.setattr(manager, "serial_paths", lambda: states.pop(0))
+    monkeypatch.setattr(manager, "device_info", lambda _p: {
+        "vid_pid": "abcd:0001", "vendor": "SomeOtherVendor", "product": "USB Serial"})
+    with pytest.raises(ValueError, match="ShenZhenCBD"):
+        manager.detect_device(None, None, input_fn=lambda _p: "", output=lambda _m: None)
+
+
+def test_flash_plug_diff_requires_interactive_or_override(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="interactive unplug/replug"):
+        manager.detect_device(None, None, prompt=False)
+
+
+def test_cli_exposes_all_commands_and_flags():
+    result = subprocess.run([str(ROOT / "canvas-klipper.sh"), "--help"], text=True,
+                            capture_output=True, check=False)
+    assert result.returncode == 0
+    for command in ("flash", "install", "uninstall", "status"):
+        assert command in result.stdout
+        help_text = subprocess.run([str(ROOT / "canvas-klipper.sh"), command, "--help"],
+                                   text=True, capture_output=True, check=False)
+        assert help_text.returncode == 0, help_text.stderr
+    flash_help = subprocess.run([str(ROOT / "canvas-klipper.sh"), "flash", "--help"], text=True,
+                                capture_output=True, check=False).stdout
+    for flag in ("--dry-run", "--yes", "--i-understand-the-risks", "--non-interactive",
+                 "--device", "--vid-pid", "--backup-file", "--recovery-file"):
+        assert flag in flash_help
+    install_help = subprocess.run([str(ROOT / "canvas-klipper.sh"), "install", "--help"], text=True,
+                                  capture_output=True, check=False).stdout
+    for flag in ("--klipper-dir", "--config-dir", "--serial", "--toolhead-sensor", "--toolhead-pin",
+                 "--separation-method", "--non-interactive"):
+        assert flag in install_help

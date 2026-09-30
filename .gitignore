@@ -3,12 +3,16 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
+htmlcov/
+*.egg-info/
 
 # Local environments
 .venv/
 venv/
+.tox/
 
 # Generated build workspaces and outputs
 /build/
 **/.build/
-/firmware/build-output/
+**/build-output/
+firmware/.sources/
