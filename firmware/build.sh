@@ -54,6 +54,7 @@ build_klipper_config() {
     make -C "$dir" olddefconfig
     make -C "$dir" clean
     make -C "$dir" -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+    cp -- "$dir/out/klipper.dict" "$OUT/$name.dict"
     if [[ -f "$dir/out/klipper.bin" ]]; then
         cp -- "$dir/out/klipper.bin" "$OUT/$name.bin"
     else
