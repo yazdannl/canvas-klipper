@@ -9,7 +9,9 @@ wiring or your printer's toolhead.
 Fill values into `config/canvas.cfg` and `config/canvas_toolhead_example.cfg` from the tables
 below. Values that stay `unknown` must stay `TO_BE_MEASURED` in the config — the installer
 refuses to activate `[include canvas/*.cfg]` and defers the Klipper restart while any
-`TO_BE_MEASURED` remains.
+`TO_BE_MEASURED` remains. The one exception is the optional per-lane `lane_T*_present_pin`
+key (§3): it ships **unset**, so a stock CC1 CANVAS install completes without any manual pin
+measurement.
 
 ## Which board "CANVAS v1" means here
 
@@ -100,7 +102,7 @@ COSMOS uses `!` (pull-up) for these four pins. This project's `config/canvas.cfg
 Klipper pull-up form to you — confirm whether the switch pulls the line low or high before
 choosing `!`.
 
-## 3. Lane-present switches (`lane_T*_present_pin`) — still unknown
+## 3. Lane-present switches (`lane_T*_present_pin`) — no source, and optional
 
 | Pin | Function | Source URL | Confidence |
 |---|---|---|---|
@@ -110,16 +112,33 @@ choosing `!`.
 | — | `lane_T3_present_pin` | no source | **unknown** |
 
 No public source documents a second, spool-end "lane present" switch per lane. [S1] configures
-one switch per lane, which [S4] describes as the channel's filament detector. This project
-requires a `lane_T*_present_pin` key and refuses to start a load while it reads clear, so:
+one switch per lane, which [S4] describes as the channel's filament detector — the `prep` switch
+of §2.
 
-- Do **not** point `lane_T*_present_pin` at `FILAMENTn` — the lane-present guard is evaluated
-  before the motor turns, and the prep switch is still clear at that moment, so every load would
-  be refused.
-- Options: (a) fit and measure your own per-lane presence switches, or (b) change the control
-  extra so the lane-present key is optional (recommended; a code change, not a config change).
+The key is therefore **optional** in this project's control extra:
 
-This is the reason the installer still defers on a stock CC1 CANVAS.
+- **Unset (the shipped default).** The lane's presence is *derived* from its own prep switch.
+  `lane.present` is only ever true while that prep switch reads active, so Canvas never reports
+  filament present for a lane whose switch reads empty. Because the prep switch is still clear
+  while filament sits upstream of the lane, the derived state cannot gate a load before motion
+  the way a real presence switch does; the bounded move to the prep switch is what proves the
+  lane holds filament, and a lane that reaches it stays guarded by that switch afterwards. A
+  lane that never reaches the prep switch within `prep_max_distance`/`prep_timeout` fails the
+  load exactly as before, with a message saying no present switch is configured.
+- **Configured.** A real switch takes precedence and gates every load before any motion, which
+  is the stricter behaviour: it can refuse a load that the derived state would allow.
+
+`CANVAS_STATUS` and `get_status()` report which of the two applies per lane in
+`lanes.<T>.present_source` (`prep` or `present_pin`).
+
+Do **not** point `lane_T*_present_pin` at that lane's `FILAMENTn` prep pin even though presence is
+now derived from it: with the key configured the guard is evaluated *before* the motor turns, and
+the prep switch is still clear then, so that combination refuses every load.
+
+To use real switches, fit and measure them, then uncomment the `lane_T*_present_pin` lines at the
+end of `config/canvas.cfg` and replace `TO_BE_MEASURED` with the measured pin. An optional key
+left at `TO_BE_MEASURED` still blocks the installer's include and restart, exactly like any
+other placeholder.
 
 ## 4. Lane LEDs (reference only — not consumed by this project)
 
@@ -181,7 +200,7 @@ delete the `hotend:` lines from `config/canvas.cfg` and keep the printer's own s
 |---|---|---|---|
 | 1 | Motor FWD/RWD swap for lanes 2 and 4 | In [S1] the `[drv8833 canvas_lane1]`/`canvas_lane3]` sections use `motor_fwd: PA7` / `motor_rwd: PB0` and `motor_fwd: PB1` / `motor_rwd: PB10`, while the `[board_pins canvas]` alias table in the same file declares `MOTOR1_FWD=PB0, MOTOR1_RWD=PA7` and `MOTOR3_FWD=PB10, MOTOR3_RWD=PB1`. The pin *pair* is agreed; which pad is "forward" is not. | Use the `[drv8833]` values (they are the ones that run in COSMOS). Verify feed vs. retract direction per lane on the bench before loading filament; swap `motor_fwd`/`motor_rwd` if a lane runs backwards. |
 | 2 | `PB0` vs `PB2` function labels on the toolhead board | [S3]'s connector table labels `PB2` = "tangle detection" (`S5`) and `PB0` = "optical filament detect" (`S2`). [S2] instead names `!hotend:PB0` "toolhead_tangle_detection" and uses `!hotend:PB2` as the hub/tool-start switch. On CC2 the two sources agree (`PA1` = tangle, `PB1` = optical). | Treat `PB2` as the toolhead/hub switch (as shipped by COSMOS). For `hub_tangle_pin`, confirm the physical sensor behind `PB0` before enabling it — if it is the optical filament detector, a wrong polarity will block every load. Leave `hub_tangle_pin` unset until verified. |
-| 3 | No per-lane presence switch | See §3. | Decide between a hardware switch and an optional-key code change. |
+| 3 | No per-lane presence switch | See §3. | Leave `lane_T*_present_pin` unset so presence is derived from the lane prep switch, or fit and measure real switches and set the keys. |
 | 4 | Silicon vs. firmware target | Board is marked GD32F303RCT6 ([S3]); COSMOS builds `stm32f401xc` ([S10]) and this project's pinned firmware does the same. | Confirm your MCU marking and that the flashed firmware actually enumerates on your board. |
 | 5 | CC2 board is a different map | CC2 CANVAS: `MOTOR0_FWD=PA1, MOTOR0_RWD=PA0, MOTOR1_FWD=PA2, MOTOR1_RWD=PA3, MOTOR2_FWD=PA7, MOTOR2_RWD=PA6, MOTOR3_FWD=PB1, MOTOR3_RWD=PB0, HALL0=PA10, HALL1=PA8, HALL2=PA11, HALL3=PA9, FILAMENT0=PB14, FILAMENT1=PB15, FILAMENT2=PB12, FILAMENT3=PB13, ODOMETER0=PC8, ODOMETER1=PC6, ODOMETER2=PC9, ODOMETER3=PC7, LED0_WHITE=PC3, LED0_RED=PB3, LED1_WHITE=PB9, LED1_RED=PB5, LED2_WHITE=PC0, LED2_RED=PB8, LED3_WHITE=PD2, LED3_RED=PC12, RFID_SCL=PB10, RFID_SDA=PB11, RFID_IRQ=PC5, buzzer PC15`, host link `/dev/ttyS1` at 250000 baud ([S5]); toolhead: `PA1` tangle, `PA2` cutter, `PB1` optical, `PB0` cover ([S6]). | Listed so nobody mistakes it for the v1 map. Do not use it on a CC1 CANVAS. |
 | 6 | COSMOS gaps | [S8] lists that RFID spool-tag reading, the CANVAS buzzer and filament eject are not implemented, and runout is lightly tested. | Do not rely on CANVAS-side RFID or buzzer behaviour. |
@@ -217,10 +236,10 @@ delete the `hotend:` lines from `config/canvas.cfg` and keep the printer's own s
 3. `motor_hall_resolution: 0.26242` on your unit — a wrong value scales every Hall-bounded
    distance, and it gates load/unload safety.
 4. Switch polarity and pull-up requirement for `PA8`/`PC7`/`PC11`/`PC0`, the toolhead switch and
-   the optional tangle/cutter inputs.
-5. A decision for `lane_T*_present_pin` (§3).
-6. Cutter actuation sense, macro, timeouts and retraction distances — these are motion/safety
+   the optional tangle/cutter inputs. Now that lane presence is derived from the prep switch (§3),
+   a lane that will not feed points at these two items far more often than at a missing spool.
+5. Cutter actuation sense, macro, timeouts and retraction distances — these are motion/safety
    parameters, not pins, and no source in this document covers them.
-7. That the flashed MCU firmware enumerates on your board (silicon vs. target mismatch, §8 #4).
+6. That the flashed MCU firmware enumerates on your board (silicon vs. target mismatch, §8 #4).
 
 Passing this project's software tests proves none of the above.

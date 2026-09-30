@@ -12,7 +12,9 @@ function group, with the source URL and a confidence value (`confirmed-in-source
 - Confirmed in the source but living on the **printer's toolhead board**, not the CANVAS mainboard:
   the toolhead/hub switch, the shared tangle input and the cover sensor. See
   `config/canvas_toolhead_example.cfg`.
-- Still unknown and left `TO_BE_MEASURED`: the four per-lane `lane_T*_present_pin` switches.
+- No source at all: the four per-lane `lane_T*_present_pin` switches. They are **optional** and
+  ship unset, so nothing has to be measured for a stock install; when unset, presence is derived
+  from that lane's prep switch.
 
 ## Known from published sources
 
@@ -47,10 +49,11 @@ that it is really your board's mapping:
 - Confirm polarity and pull-up requirement for `canvas:PA8` / `PC7` / `PC11` / `PC0` (per-lane
   filament switches) and for the toolhead switch, and confirm the actual sensor behind
   `hotend:PB0` before enabling `hub_tangle_pin` (the sources disagree on its label).
-- Resolve `lane_T*_present_pin`. No source documents such a switch. Do **not** point it at the
-  prep pin: the lane-present guard is checked before the motor turns, so that combination refuses
-  every load. Either fit and measure your own switches or change the control extra to make the key
-  optional.
+- Resolve `lane_T*_present_pin` only if you fitted real switches; the key is optional. Left unset,
+  presence is derived from the lane prep switch, so the bounded drive to that switch is what
+  proves the lane holds filament and a lane that never reaches it fails safely. If you do set the
+  key, do **not** point it at that lane's prep pin: a configured switch gates loading before any
+  motion, so that combination refuses every load.
 - Verify PWM-capable pins, Hall electrical type/edge behavior and actual motor topology, and
   measure the cutter actuation sense, macros, timeouts and retraction distances. Those are
   motion/safety parameters; no published source covers them.
