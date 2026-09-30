@@ -59,9 +59,9 @@ def linux_usb_ids(device):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Flash an Elegoo CANVAS v1 MCU via OEM YMODEM then Katapult.",
-        epilog=("No printer, serial device, or firmware is touched unless --execute, "
-                "--i-understand-the-risks, matching USB identity, backup/recovery "
-                "files, and typed confirmations are all supplied."))
+        epilog=("Default is dry-run. A write requires --execute, --i-understand-the-risks, "
+                "matching USB identity, and confirmations. Missing backup files are permitted "
+                "only with --allow-no-backup --yes --i-understand-the-risks."))
     stage = parser.add_mutually_exclusive_group(required=True)
     stage.add_argument("--install-katapult", action="store_true",
                        help="stage 1: send Katapult deployer using mcu-flasher --canvas")
@@ -81,7 +81,11 @@ def parse_args(argv=None):
     parser.add_argument("--recovery-image", help="path to verified recovery image")
     parser.add_argument("--timeout", type=int, default=20)
     parser.add_argument("--i-understand-the-risks", action="store_true",
-                        help="required for --execute; also requires typed confirmations")
+                        help="required for --execute")
+    parser.add_argument("--yes", action="store_true",
+                        help="skip prompts; requires --i-understand-the-risks")
+    parser.add_argument("--allow-no-backup", action="store_true",
+                        help="allow missing stock/recovery files after explicit risk acknowledgement")
     return parser
 
 
@@ -112,11 +116,16 @@ def preflight(args):
     if args.execute:
         if not args.i_understand_the_risks:
             raise ValueError("--execute requires --i-understand-the-risks")
+        if args.yes and not args.i_understand_the_risks:
+            raise ValueError("--yes requires --i-understand-the-risks")
+        if bool(args.stock_backup) != bool(args.recovery_image):
+            raise ValueError("--stock-backup and --recovery-image must be supplied together")
+        if not args.stock_backup and not (args.allow_no_backup and args.yes):
+            raise ValueError("--execute requires backup/recovery files, or --allow-no-backup --yes")
         for path, label in ((args.stock_backup, "stock backup"),
                              (args.recovery_image, "recovery image")):
-            if not path:
-                raise ValueError("--execute requires --stock-backup and --recovery-image")
-            file_size(path, label)
+            if path:
+                file_size(path, label)
     return expected
 
 
@@ -135,6 +144,8 @@ def run(args, *, identity_reader=linux_usb_ids, runner=subprocess.run,
         output("Stock backup: %s" % args.stock_backup)
     if args.recovery_image:
         output("Recovery image: %s" % args.recovery_image)
+    if not args.stock_backup:
+        output("WARNING: no stock firmware backup/recovery files supplied; recovery may require SWD.")
     if args.install_katapult:
         command = [str(PINNED_MCU_FLASHER), "--canvas", "--no-wait", "--timeout",
                    str(args.timeout), "--firmware-version", "1.0.0",
@@ -154,6 +165,9 @@ def run(args, *, identity_reader=linux_usb_ids, runner=subprocess.run,
     utility = PINNED_MCU_FLASHER if args.install_katapult else PINNED_KATAPULT_FLASHTOOL
     if not utility.is_file():
         raise ValueError("pinned flash utility is missing; run firmware/build.sh first")
+    if args.yes:
+        input_fn = lambda prompt: args.device if "device path" in prompt else (
+            "BACKUP-AND-RECOVERY-VERIFIED" if "BACKUP" in prompt else "FLASH-CANVAS")
     if args.install_katapult and not os.access(utility, os.X_OK):
         raise ValueError("pinned mcu-flasher is not executable; rebuild it")
     if input_fn("Type the full device path to confirm: ").strip() != args.device:
