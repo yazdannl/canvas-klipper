@@ -1,0 +1,14 @@
+# Python and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Local environments
+.venv/
+venv/
+
+# Generated build workspaces and outputs
+/build/
+**/.build/
+/firmware/build-output/
