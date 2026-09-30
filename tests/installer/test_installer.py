@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import subprocess
 import threading
 from types import SimpleNamespace
@@ -104,7 +105,7 @@ def cli_install(klipper, config, moonraker, serial, *, sensor="tool_sensor", pin
     return manager.make_parser().parse_args(argv)
 
 
-def test_install_fresh_and_rerun_are_safe_and_idempotent(tmp_path, monkeypatch, moonraker):
+def test_install_fresh_and_rerun_are_safe_and_idempotent(tmp_path, monkeypatch, moonraker, capsys):
     home, klipper, config, serial = fake_tree(tmp_path)
     log = fake_commands(tmp_path, monkeypatch)
     monkeypatch.setenv("HOME", str(home))
@@ -116,24 +117,36 @@ def test_install_fresh_and_rerun_are_safe_and_idempotent(tmp_path, monkeypatch, 
     printer = (config / "printer.cfg").read_text()
     moon = (config / "moonraker.conf").read_text()
     generated = (config / "canvas/canvas.cfg").read_text()
-    # Placeholder pins are still unresolved, so the include must stay inactive.
-    assert printer == original_printer
-    assert "[include canvas/*.cfg]" not in printer
+    # The lane-present pins are optional, so nothing blocks the include or the restart.
+    assert printer.startswith(original_printer.rstrip())
+    assert printer.count("[include canvas/*.cfg]") == 1
     assert "[update_manager canvas-klipper]" in moon
     assert "serial: %s" % serial in generated
     assert "toolhead_sensor: tool_sensor" in generated
     assert "separation_method: tip_forming" in generated
     assert "[filament_switch_sensor tool_sensor]" not in generated
+    assert not re.search(r"(?m)^\s*lane_T\d_present_pin:", generated)
+    assert [line for line in generated.splitlines()
+            if "TO_BE_MEASURED" in line and not line.strip().startswith("#")] == []
+    assert manager.canvas_config_complete(config / "printer.cfg", config / "canvas/canvas.cfg")
     assert (klipper / "klippy/extras/canvas.py").is_symlink()
-    assert not list(config.glob("printer.cfg.*.bak"))
+    assert len(list(config.glob("printer.cfg.*.bak"))) == 1
     assert len(list(config.glob("moonraker.conf.*.bak"))) == 1
+    out = capsys.readouterr().out
+    assert "restart deferred" not in out
+    assert "NOT verified on your hardware" in out
+    for risk in ("T1/T3", "hotend:PB0", "hotend:PB2", "motor_hall_resolution 0.26242"):
+        assert risk in out, risk
+    calls = log.read_text().splitlines()
+    assert calls == ["systemctl restart klipper", "systemctl restart moonraker"]
+
     assert manager.install(args) == 0
     assert (config / "printer.cfg").read_text() == printer
     assert (config / "moonraker.conf").read_text() == moon
     assert (config / "canvas/canvas.cfg").read_text() == generated
-    assert not list(config.glob("printer.cfg.*.bak"))
+    assert len(list(config.glob("printer.cfg.*.bak"))) == 1
     assert len(list(config.glob("moonraker.conf.*.bak"))) == 1
-    assert not log.exists()  # incomplete pin scaffold is never restarted
+    assert log.read_text().splitlines() == calls  # rerun restarts nothing
 
 
 def test_install_cli_runs_with_fake_home(tmp_path, monkeypatch, moonraker):
@@ -145,11 +158,11 @@ def test_install_cli_runs_with_fake_home(tmp_path, monkeypatch, moonraker):
                "--non-interactive", "--toolhead-sensor", "tool_sensor", "--separation-method", "cutter"]
     result = subprocess.run(command, env=env, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
-    assert "[include canvas/*.cfg]" not in (config / "printer.cfg").read_text()
+    assert (config / "printer.cfg").read_text().count("[include canvas/*.cfg]") == 1
     assert "separation_method: cutter" in (config / "canvas/canvas.cfg").read_text()
-    assert "restart deferred" in result.stdout
-    assert "TO_BE_MEASURED" in result.stdout or "lane_T0_motor" in result.stdout
-    assert not log.exists()  # the copied template has no measured lane pins yet
+    assert "restart deferred" not in result.stdout
+    assert "NOT verified on your hardware" in result.stdout
+    assert log.read_text().splitlines() == ["systemctl restart klipper", "systemctl restart moonraker"]
 
 
 def test_install_without_sensor_generates_sensor_config(tmp_path, monkeypatch, moonraker):
@@ -162,23 +175,37 @@ def test_install_without_sensor_generates_sensor_config(tmp_path, monkeypatch, m
     assert "toolhead_sensor: canvas_toolhead" in generated
 
 
-def add_measured_pins(config_dir):
-    """Fill the shipped template's remaining placeholder: the lane-present switches.
-
-    The distributed template now carries the published driver and prep pins, so the only
-    unresolved values are the four lane_T*_present_pin keys, which no public source maps.
-    """
+def break_required_pin(config_dir, key):
+    """Put the shipped template's remaining placeholder back into a required key."""
     path = config_dir / "canvas/canvas.cfg"
     text = path.read_text()
-    for lane in range(4):
-        assert "lane_T%d_present_pin: TO_BE_MEASURED" % lane in text
-        text = text.replace("lane_T%d_present_pin: TO_BE_MEASURED" % lane,
-                            "lane_T%d_present_pin: canvas:PC%d" % (lane, 4 + lane))
+    setting = re.search(r"(?m)^(%s:\s*).*$" % re.escape(key), text)
+    assert setting, key
+    return fill_required_pin(config_dir, key, "TO_BE_MEASURED")
+
+
+def fill_required_pin(config_dir, key, value):
+    path = config_dir / "canvas/canvas.cfg"
+    text = path.read_text()
+    text, count = re.subn(r"(?m)^(%s:\s*).*$" % re.escape(key), lambda m: m.group(1) + value,
+                          text, count=1)
+    assert count == 1, key
     path.write_text(text)
 
 
-def test_shipped_template_leaves_only_lane_present_pins_unmeasured():
-    """The distributed template must be complete except for the unmeasured lane-present keys."""
+def add_present_pins(config_dir, pin="canvas:PC4"):
+    """Opt in to real per-lane presence switches, as a user who fitted them would."""
+    path = config_dir / "canvas/canvas.cfg"
+    text = path.read_text()
+    for lane in range(4):
+        source = "# lane_T%d_present_pin: TO_BE_MEASURED" % lane
+        assert source in text
+        text = text.replace(source, "lane_T%d_present_pin: %s" % (lane, pin))
+    path.write_text(text)
+
+
+def test_shipped_template_has_no_placeholders_and_optional_lane_present_pins():
+    """The distributed template must carry no placeholder and no lane-present key."""
     template = (ROOT / "config/canvas.cfg").read_text()
     settings = manager.canvas_settings([ROOT / "config/canvas.cfg"])
     assert "__duplicate_sections__" not in settings
@@ -189,16 +216,17 @@ def test_shipped_template_leaves_only_lane_present_pins_unmeasured():
             assert driver[option] and not driver[option].startswith("TO_BE_MEASURED")
         assert canvas["lane_t%d_motor" % lane] == "T%d" % lane
         assert canvas["lane_t%d_prep_pin" % lane].startswith("canvas:")
-        assert canvas["lane_t%d_present_pin" % lane] == "TO_BE_MEASURED"
+        # Optional: presence is derived from the prep switch until a real switch is set.
+        assert "lane_t%d_present_pin" % lane not in canvas
     # Any other placeholder would be a silent gap in the published pin map.
     leftovers = [line for line in template.splitlines()
-                 if "TO_BE_MEASURED" in line and not line.strip().startswith("#")
-                 and not line.strip().startswith("lane_T")]
+                 if "TO_BE_MEASURED" in line and not line.strip().startswith("#")]
     assert leftovers == []
+    assert "# lane_T3_present_pin: TO_BE_MEASURED" in template  # documented opt-in block
 
 
-def test_canvas_config_complete_requires_every_pin_to_be_real(tmp_path):
-    """Any single remaining placeholder anywhere must keep the include inactive."""
+def test_canvas_config_complete_treats_lane_present_pins_as_optional(tmp_path):
+    """Absent optional pins must not block; any surviving placeholder must."""
     config = tmp_path / "printer_data/config"
     (config / "canvas").mkdir(parents=True)
     (config / "printer.cfg").write_text(
@@ -207,20 +235,29 @@ def test_canvas_config_complete_requires_every_pin_to_be_real(tmp_path):
     canvas_cfg = config / "canvas/canvas.cfg"
     shipped = (ROOT / "config/canvas.cfg").read_text(encoding="utf-8").replace(
         "toolhead_sensor: toolhead", "toolhead_sensor: tool_sensor")
-    def with_measured_present_pins(text):
-        for lane in range(4):
-            text = text.replace("lane_T%d_present_pin: TO_BE_MEASURED" % lane,
-                                "lane_T%d_present_pin: canvas:PC%d" % (lane, 4 + lane))
-        return text
     head = "[mcu canvas]\nserial: /dev/serial/by-id/usb-Canvas\n\n"
+
     canvas_cfg.write_text(head + shipped, encoding="utf-8")
-    assert manager.canvas_config_complete(config / "printer.cfg", canvas_cfg) is False
-    complete = head + with_measured_present_pins(shipped)
-    canvas_cfg.write_text(complete, encoding="utf-8")
     assert manager.canvas_config_complete(config / "printer.cfg", canvas_cfg) is True
+
+    # An optional key that is set to a placeholder still blocks: it is not a usable pin.
+    for lane in range(4):
+        broken = shipped.replace("# lane_T%d_present_pin: TO_BE_MEASURED" % lane,
+                                 "lane_T%d_present_pin: TO_BE_MEASURED" % lane)
+        canvas_cfg.write_text(head + broken, encoding="utf-8")
+        assert manager.canvas_config_complete(config / "printer.cfg", canvas_cfg) is False
+    # A measured optional value is accepted and does not re-block.
+    canvas_cfg.write_text(head + shipped.replace(
+        "# lane_T0_present_pin: TO_BE_MEASURED", "lane_T0_present_pin: canvas:PC4"),
+        encoding="utf-8")
+    assert manager.canvas_config_complete(config / "printer.cfg", canvas_cfg) is True
+
+    complete = head + shipped.replace(
+        "# lane_T0_present_pin: TO_BE_MEASURED", "lane_T0_present_pin: canvas:PC4")
     for source, broken in (("motor_hall: canvas:PB6", "motor_hall: TO_BE_MEASURED"),
                            ("motor_hall_resolution: 0.26242",
                             "motor_hall_resolution: TO_BE_MEASURED"),
+                           ("lane_T0_motor: T0", "lane_T0_motor: TO_BE_MEASURED"),
                            ("lane_T1_prep_pin: canvas:PC7",
                             "lane_T1_prep_pin: TO_BE_MEASURED"),
                            ("cutter_sensor_pin: !hotend:PC5",
@@ -233,23 +270,49 @@ def test_canvas_config_complete_requires_every_pin_to_be_real(tmp_path):
     assert manager.canvas_config_complete(config / "printer.cfg", canvas_cfg) is False
 
 
-def test_restart_waits_for_measured_config_then_is_idempotent(tmp_path, monkeypatch, moonraker):
+def test_required_placeholder_defers_then_completes_idempotently(tmp_path, monkeypatch, moonraker,
+                                                                capsys):
     home, klipper, config, serial = fake_tree(tmp_path)
     log = fake_commands(tmp_path, monkeypatch)
     args = cli_install(klipper, config, moonraker, serial)
-    manager.install(args)
-    assert not log.exists()
-    add_measured_pins(config)
     assert manager.install(args) == 0
-    printer = (config / "printer.cfg").read_text()
-    assert printer.count("[include canvas/*.cfg]") == 1
-    assert len(list(config.glob("printer.cfg.*.bak"))) == 1
+    assert (config / "printer.cfg").read_text().count("[include canvas/*.cfg]") == 1
     calls = log.read_text().splitlines()
-    assert calls == ["systemctl restart klipper", "systemctl restart moonraker"]
+
+    break_required_pin(config, "lane_T1_prep_pin")
+    assert manager.install(args) == 0
+    deferred = capsys.readouterr().out
+    assert "restart deferred" in deferred
+    assert "lane_T0_motor..lane_T3_motor and each lane's prep_pin" in deferred
+    assert "lane_T*_present_pin is optional" in deferred
+    assert log.read_text().splitlines() == calls  # nothing restarts on an incomplete config
+    assert len(list(config.glob("printer.cfg.*.bak"))) == 1
+
+    fill_required_pin(config, "lane_T1_prep_pin", "canvas:PC13")
+    assert manager.install(args) == 0
+    assert "restart deferred" not in capsys.readouterr().out
+    # Complete again: Klipper restarts for the new config, Moonraker has no reason to.
+    completed = calls + ["systemctl restart klipper"]
+    assert log.read_text().splitlines() == completed
+    printer = (config / "printer.cfg").read_text()
     assert manager.install(args) == 0
     assert (config / "printer.cfg").read_text() == printer
-    assert log.read_text().splitlines() == calls
+    assert log.read_text().splitlines() == completed
     assert len(list(config.glob("printer.cfg.*.bak"))) == 1
+
+
+def test_measured_presence_pins_stay_accepted_and_idempotent(tmp_path, monkeypatch, moonraker,
+                                                             capsys):
+    home, klipper, config, serial = fake_tree(tmp_path)
+    log = fake_commands(tmp_path, monkeypatch)
+    args = cli_install(klipper, config, moonraker, serial)
+    assert manager.install(args) == 0
+    calls = log.read_text().splitlines()
+    add_present_pins(config)
+    assert manager.install(args) == 0
+    assert "restart deferred" not in capsys.readouterr().out
+    assert "lane_T0_present_pin: canvas:PC4" in (config / "canvas/canvas.cfg").read_text()
+    assert log.read_text().splitlines() == calls + ["systemctl restart klipper"]
 
 
 def test_install_refuses_printing_before_any_changes(tmp_path, monkeypatch, moonraker):
@@ -473,8 +536,6 @@ def test_uninstall_never_restarts_services_and_keeps_unique_backups(tmp_path, mo
     home, klipper, config, serial = fake_tree(tmp_path)
     log = fake_commands(tmp_path, monkeypatch)
     args = cli_install(klipper, config, moonraker, serial)
-    manager.install(args)
-    add_measured_pins(config)
     manager.install(args)
     printer_backup = next(iter(config.glob("printer.cfg.*.bak")))
     saved = printer_backup.read_text()
