@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Conservative two-stage CANVAS v1 firmware flasher; dry-run is the default."""
+import argparse
+import hashlib
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+
+FLASH_SIZE = 0x40000
+APP_OFFSET = 0x10000
+KATAPULT_VID_PID = "1d50:6177"
+CANVAS_HEADER_SIZE = 0x4000  # mcu-flasher metadata and padding total 16 KiB
+ROOT = Path(__file__).resolve().parents[1]
+PINNED_MCU_FLASHER = ROOT / "firmware/build-output/mcu-flasher"
+PINNED_KATAPULT_FLASHTOOL = ROOT / "firmware/.build/work/katapult/scripts/flashtool.py"
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def file_size(path, label):
+    p = Path(path)
+    if not p.is_file():
+        raise ValueError("%s is not a regular file: %s" % (label, path))
+    size = p.stat().st_size
+    if size <= 0:
+        raise ValueError("%s is empty: %s" % (label, path))
+    return size
+
+
+def linux_usb_ids(device):
+    """Read USB identity from sysfs only; never open the serial endpoint."""
+    tty = os.path.basename(os.path.realpath(device))
+    node = Path("/sys/class/tty") / tty / "device"
+    try:
+        node = node.resolve(strict=True)
+    except OSError:
+        return None
+    for parent in (node, *node.parents):
+        vendor = parent / "idVendor"
+        product = parent / "idProduct"
+        if vendor.is_file() and product.is_file():
+            try:
+                return "%s:%s" % (vendor.read_text().strip().lower(),
+                                   product.read_text().strip().lower())
+            except OSError:
+                return None
+    return None
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Flash an Elegoo CANVAS v1 MCU via OEM YMODEM then Katapult.",
+        epilog=("No printer, serial device, or firmware is touched unless --execute, "
+                "--i-understand-the-risks, matching USB identity, backup/recovery "
+                "files, and typed confirmations are all supplied."))
+    stage = parser.add_mutually_exclusive_group(required=True)
+    stage.add_argument("--install-katapult", action="store_true",
+                       help="stage 1: send Katapult deployer using mcu-flasher --canvas")
+    stage.add_argument("--flash-klipper", action="store_true",
+                       help="stage 2: program Klipper through Katapult flashtool")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", dest="execute", action="store_false",
+                      help="show checks and planned command only (default)")
+    mode.add_argument("--execute", dest="execute", action="store_true",
+                      help="perform the selected destructive operation")
+    parser.set_defaults(execute=False)
+    parser.add_argument("--device", required=True, help="explicit serial device path")
+    parser.add_argument("--deployer", help="Katapult deployer image for stage 1")
+    parser.add_argument("--firmware", help="Klipper application .bin for stage 2")
+    parser.add_argument("--vid-pid", help="expected OEM bootloader VID:PID (stage 1 only)")
+    parser.add_argument("--stock-backup", help="path to preserved stock flash backup")
+    parser.add_argument("--recovery-image", help="path to verified recovery image")
+    parser.add_argument("--timeout", type=int, default=20)
+    parser.add_argument("--i-understand-the-risks", action="store_true",
+                        help="required for --execute; also requires typed confirmations")
+    return parser
+
+
+def preflight(args):
+    if args.timeout < 1:
+        raise ValueError("--timeout must be positive")
+    if args.install_katapult:
+        if not args.deployer:
+            raise ValueError("--deployer is required with --install-katapult")
+        size = file_size(args.deployer, "Katapult deployer")
+        if size + CANVAS_HEADER_SIZE > FLASH_SIZE:
+            raise ValueError("deployer plus Canvas header exceeds flash capacity")
+        expected = args.vid_pid
+        if args.execute and not expected:
+            raise ValueError("stage 1 requires the observed OEM --vid-pid")
+        if expected and not re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{4}", expected):
+            raise ValueError("--vid-pid must have form vvvv:pppp using hexadecimal digits")
+        expected = expected.lower() if expected else None
+    else:
+        if not args.firmware:
+            raise ValueError("--firmware is required with --flash-klipper")
+        size = file_size(args.firmware, "Klipper firmware")
+        if args.vid_pid:
+            raise ValueError("--vid-pid applies only to the OEM bootloader stage")
+        if size > FLASH_SIZE - APP_OFFSET:
+            raise ValueError("Klipper image does not fit above the pinned app offset")
+        expected = KATAPULT_VID_PID
+    if args.execute:
+        if not args.i_understand_the_risks:
+            raise ValueError("--execute requires --i-understand-the-risks")
+        for path, label in ((args.stock_backup, "stock backup"),
+                             (args.recovery_image, "recovery image")):
+            if not path:
+                raise ValueError("--execute requires --stock-backup and --recovery-image")
+            file_size(path, label)
+    return expected
+
+
+def run(args, *, identity_reader=linux_usb_ids, runner=subprocess.run,
+        input_fn=input, output=print):
+    expected = preflight(args)
+    image = args.deployer if args.install_katapult else args.firmware
+    size = file_size(image, "firmware image")
+    output("Stage: %s" % ("install Katapult (OEM YMODEM)" if args.install_katapult
+                           else "flash Klipper (Katapult)"))
+    output("Device: %s" % args.device)
+    output("Image: %s (%d bytes, SHA-256 %s)" % (image, size, sha256(image)))
+    output("Expected USB identity: %s" % (expected or "supply observed OEM VID:PID"))
+    output("App offset: 0x%X; flash size: 0x%X" % (APP_OFFSET, FLASH_SIZE))
+    if args.stock_backup:
+        output("Stock backup: %s" % args.stock_backup)
+    if args.recovery_image:
+        output("Recovery image: %s" % args.recovery_image)
+    if args.install_katapult:
+        command = [str(PINNED_MCU_FLASHER), "--canvas", "--no-wait", "--timeout",
+                   str(args.timeout), "--firmware-version", "1.0.0",
+                   "--firmware", args.deployer, args.device]
+    else:
+        command = [sys.executable, str(PINNED_KATAPULT_FLASHTOOL), "--device", args.device,
+                   "--firmware", args.firmware]
+    output("Planned command: %s" % shlex.join(command))
+    if not args.execute:
+        output("DRY RUN: no USB identity read and no serial device opened; no changes made.")
+        return 0
+
+    actual = identity_reader(args.device)
+    if actual != expected:
+        raise ValueError("wrong or unknown USB device: expected %s, found %s" %
+                         (expected, actual or "no USB identity"))
+    utility = PINNED_MCU_FLASHER if args.install_katapult else PINNED_KATAPULT_FLASHTOOL
+    if not utility.is_file():
+        raise ValueError("pinned flash utility is missing; run firmware/build.sh first")
+    if args.install_katapult and not os.access(utility, os.X_OK):
+        raise ValueError("pinned mcu-flasher is not executable; rebuild it")
+    if input_fn("Type the full device path to confirm: ").strip() != args.device:
+        raise ValueError("device-path confirmation did not match")
+    if input_fn("Type BACKUP-AND-RECOVERY-VERIFIED to continue: ").strip() != \
+            "BACKUP-AND-RECOVERY-VERIFIED":
+        raise ValueError("backup/recovery confirmation did not match")
+    if input_fn("Type FLASH-CANVAS to authorize this firmware write: ").strip() != \
+            "FLASH-CANVAS":
+        raise ValueError("flash confirmation did not match")
+
+    output("Executing pinned flash utility; keep stable power and do not unplug/reset.")
+    result = runner(command, check=False, timeout=args.timeout * 4)
+    if result.returncode:
+        raise RuntimeError("flash utility failed with exit status %d; do not automatically retry" %
+                           result.returncode)
+    output("Flash utility reported success. Verify enumeration and Klipper MCU identity manually.")
+    return 0
+
+
+def main(argv=None):
+    parser = parse_args(argv)
+    args = parser.parse_args(argv)
+    try:
+        return run(args)
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        parser.error(str(exc))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
